@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Основная тема приложения -->
+    <style name="Theme.AutoPhotoPose" parent="Theme.AppCompat.Light.NoActionBar">
+        <!-- Основной цвет приложения -->
+        <item name="colorPrimary">@color/purple_500</item>
+        <!-- Темный вариант основного цвета (для статус-бара) -->
+        <item name="colorPrimaryDark">@color/purple_700</item>
+        <!-- Акцентный цвет (кнопки, переключатели и т.д.) -->
+        <item name="colorAccent">@color/teal_200</item>
+        <!-- Отключаем ActionBar, чтобы CameraX занимал весь экран -->
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+    </style>
+</resources>
