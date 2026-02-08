@@ -33,7 +33,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
     buildFeatures {
-        viewBinding = true
+        compose = true
     }
 }
 
@@ -70,5 +70,11 @@ dependencies {
 
     // MediaPipe Pose
     implementation(libs.mediapipe.tasks.vision)
+
+    implementation(libs.tensorflow.lite)
+
+    implementation(libs.androidx.compose.material.icons.core)
+
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
 
 }

@@ -57,7 +57,7 @@ class PoseStabilityDetector(
      * Считаем среднеквадратичное изменене (L2) между текущими и предыдущими точками
      */
     private fun calcLandmarksDelta(prev: List<Landmark>, curr: List<Landmark>): Float {
-        if (prev.size != curr.size) return Float.MAX_VALUE // защита
+        if (prev.size != curr.size) return Float.MAX_VALUE
         var sum = 0f
         for (i in curr.indices) {
             val dx = curr[i].x - prev[i].x
