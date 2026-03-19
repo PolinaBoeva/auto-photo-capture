@@ -1,12 +1,10 @@
 package com.example.autophotopose
 
 import android.app.Application
-import android.content.ContentUris
 import android.content.ContentValues
-import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.ImageDecoder
 import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import androidx.camera.core.*
@@ -15,156 +13,118 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.viewModelScope
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.examples.poselandmarker.PoseLandmarkerHelper
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
 
-    // =======================
-    // UI STATE
-    // =======================
-
+    // UI state
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState
 
-    // =======================
+    private val appContext = getApplication<Application>()
+
+    private val aestheticPredictor = AestheticPredictor(appContext)
+
+    // PoseLandmarker
+    private val poseHelper: PoseLandmarkerHelper
+
     // CameraX
-    // =======================
-
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-
     private lateinit var imageAnalysis: ImageAnalysis
     private lateinit var imageCapture: ImageCapture
 
-    // =======================
-    // Overlay
-    // =======================
-
-    private var overlayView: OverlayView? = null
-
-    fun setOverlayView(view: OverlayView) {
-        overlayView = view
-    }
-
-    // =======================
-    // ML
-    // =======================
-
-    private val poseHelper: PoseLandmarkerHelper
-
-    private val poseStabilityDetector = PoseStabilityDetector(
-        bufferSize = 15,
-        threshold = 0.02f,
-        stableFramesNeeded = 7
-    )
-
-    private val aestheticPredictor = AestheticPredictor(application)
-
-    // =======================
-    // Best frames
-    // =======================
-
-    private data class ScoredBitmap(val bitmap: Bitmap, val score: Float)
-
-    private val topFrames = mutableListOf<ScoredBitmap>()
+    // Топовые кадры
+    private val topFrames = mutableListOf<Pair<Bitmap, Float>>() // Pair<Bitmap, score>
     private val maxTopFrames = 3
-    private var frameCounter = 0
 
-    // =======================
-    // Init
-    // =======================
+    // Adaptive cooldown
+    private var lastSavedTime = 0L
+    private var lastSavedScore = 5f       // начальное значение
+    private val baseCooldown = 5000L      // 5 секунд
+    private var isCapturing = false
+
+    // Live pose results для Compose
+    var poseResults by mutableStateOf<PoseLandmarkerHelper.ResultBundle?>(null)
+        private set
 
     init {
         poseHelper = PoseLandmarkerHelper(
             context = application,
             runningMode = RunningMode.LIVE_STREAM,
-            poseLandmarkerHelperListener =
-                object : PoseLandmarkerHelper.LandmarkerListener {
+            poseLandmarkerHelperListener = object : PoseLandmarkerHelper.LandmarkerListener {
+                override fun onError(error: String, errorCode: Int) {
+                    Log.e("PoseLandmarker", error)
+                }
 
-                    override fun onError(error: String, errorCode: Int) {
-                        Log.e("PoseLandmarker", error)
-                    }
+                override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+                    poseResults = resultBundle
 
-                    override fun onResults(
-                        resultBundle: PoseLandmarkerHelper.ResultBundle
-                    ) {
-                        // 1️⃣ Overlay (UI thread safe)
-                        overlayView?.post {
-                            overlayView?.setResults(
-                                results = resultBundle.results,
-                                imageHeight = resultBundle.inputImageHeight,
-                                imageWidth = resultBundle.inputImageWidth
-                            )
-                        }
+                    if (_uiState.value.isCaptureActive && !isCapturing) {
+                        isCapturing = true
 
-                        // 2️⃣ Smart capture logic
-                        handlePoseResults(resultBundle)
+                        // Берём последний bitmap из PoseLandmarkerHelper
+                        val bitmap = poseHelper.lastFrameBitmap
+                        bitmap?.let { evaluateAndStoreTopFrame(it) }
+
+                        isCapturing = false
                     }
                 }
+            }
         )
     }
 
-    // =======================
+    // =========================
     // Camera binding
-    // =======================
-
-    fun bindCamera(
-        previewView: PreviewView,
-        lifecycleOwner: LifecycleOwner
-    ) {
+    // =========================
+    fun bindCamera(previewView: PreviewView, lifecycleOwner: LifecycleOwner) {
         if (!::imageCapture.isInitialized) createImageCapture()
         if (!::imageAnalysis.isInitialized) createImageAnalysis()
 
-        val context = previewView.context
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(previewView.context)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-
             val preview = Preview.Builder().build().apply {
                 setSurfaceProvider(previewView.surfaceProvider)
             }
-
-            val selector =
-                if (uiState.value.isFrontCamera)
-                    CameraSelector.DEFAULT_FRONT_CAMERA
-                else
-                    CameraSelector.DEFAULT_BACK_CAMERA
+            val selector = if (_uiState.value.isFrontCamera)
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            else
+                CameraSelector.DEFAULT_BACK_CAMERA
 
             cameraProvider.unbindAll()
             cameraProvider.bindToLifecycle(
-                lifecycleOwner,
-                selector,
-                preview,
-                imageCapture,
-                imageAnalysis
+                lifecycleOwner, selector, preview, imageCapture, imageAnalysis
             )
-        }, ContextCompat.getMainExecutor(context))
+        }, ContextCompat.getMainExecutor(previewView.context))
     }
 
-    // =======================
-    // CameraX helpers
-    // =======================
-
     private fun createImageAnalysis(): ImageAnalysis {
-        imageAnalysis = ImageAnalysis.Builder()
+        return ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
-            .also {
-                it.setAnalyzer(cameraExecutor) { imageProxy ->
+            .also { analysis ->
+                analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                     poseHelper.detectLiveStream(
                         imageProxy,
-                        isFrontCamera = uiState.value.isFrontCamera
+                        isFrontCamera = _uiState.value.isFrontCamera
                     )
                 }
-            }
-        return imageAnalysis
+            }.also { imageAnalysis = it }
     }
 
     private fun createImageCapture(): ImageCapture {
@@ -172,10 +132,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         return imageCapture
     }
 
-    // =======================
+    // =========================
     // UI actions
-    // =======================
-
+    // =========================
     fun toggleCapture() {
         _uiState.value = _uiState.value.copy(
             isCaptureActive = !_uiState.value.isCaptureActive
@@ -188,142 +147,107 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
-    // =======================
-    // Pose + Aesthetic logic
-    // =======================
+    private fun getPersonRoi(
+        bitmap: Bitmap,
+        resultBundle: PoseLandmarkerHelper.ResultBundle?
+    ): android.graphics.Rect? {
+        val results = resultBundle?.results ?: return null
+        val firstResult = results.firstOrNull() ?: return null
 
-    private fun handlePoseResults(
-        resultBundle: PoseLandmarkerHelper.ResultBundle
-    ) {
-        if (!_uiState.value.isCaptureActive) return
+        val landmarksList = firstResult.landmarks() ?: return null
 
-        resultBundle.results.forEach { result ->
-            val pose = result.landmarks()?.firstOrNull() ?: return@forEach
-            val landmarks = pose.map { Landmark(it.x(), it.y()) }
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = Float.MIN_VALUE
+        var maxY = Float.MIN_VALUE
 
-            val frameBitmap = poseHelper.lastFrameBitmap ?: return@forEach
+        landmarksList.forEach { landmarkList ->
+            landmarkList.forEach { landmark ->
+                val x = landmark.x() * bitmap.width
+                val y = landmark.y() * bitmap.height
 
-            val stableFrames =
-                poseStabilityDetector.addFrame(frameBitmap, landmarks)
-                    ?: return@forEach
-
-            stableFrames.forEach { bmp ->
-                frameCounter++
-                if (frameCounter % 3 != 0) return@forEach
-
-                val score = aestheticPredictor.predictAesthetic(bmp)
-
-                topFrames.add(
-                    ScoredBitmap(
-                        bmp.copy(Bitmap.Config.ARGB_8888, true),
-                        score
-                    )
-                )
-
-                topFrames.sortByDescending { it.score }
-                if (topFrames.size > maxTopFrames) {
-                    topFrames.removeAt(topFrames.lastIndex)
-                }
-
-                _uiState.value = _uiState.value.copy(
-                    bestScore = topFrames.firstOrNull()?.score
-                )
+                minX = minOf(minX, x)
+                minY = minOf(minY, y)
+                maxX = maxOf(maxX, x)
+                maxY = maxOf(maxY, y)
             }
         }
+
+        // Если нет точек — пропускаем
+        if (minX == Float.MAX_VALUE || minY == Float.MAX_VALUE) return null
+
+        val width = maxX - minX
+        val height = maxY - minY
+        val padX = width * 0.25f
+        val padY = height * 0.35f
+
+        val left = (minX - padX).toInt().coerceAtLeast(0)
+        val top = (minY - padY).toInt().coerceAtLeast(0)
+        val right = (maxX + padX).toInt().coerceAtMost(bitmap.width)
+        val bottom = (maxY + padY).toInt().coerceAtMost(bitmap.height)
+
+        return android.graphics.Rect(left, top, right, bottom)
     }
 
-    // =======================
-    // Gallery preview
-    // =======================
+    private fun evaluateAndStoreTopFrame(bitmap: Bitmap) {
+        val roiRect = getPersonRoi(bitmap, poseResults)
+        val roiBitmap = roiRect?.let { Bitmap.createBitmap(bitmap, it.left, it.top, it.width(), it.height()) } ?: bitmap
+        val score = aestheticPredictor.predictAesthetic(roiBitmap)
 
-    fun loadLastGalleryImage(context: Context) {
-        val cursor = context.contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            arrayOf(MediaStore.Images.Media._ID),
-            null,
-            null,
-            "${MediaStore.Images.Media.DATE_ADDED} DESC"
-        )
+        // 1️⃣ Добавляем в topFrames, если лучше существующих
+        topFrames.add(Pair(roiBitmap, score))
+        topFrames.sortByDescending { it.second }
 
-        cursor?.use {
-            if (it.moveToFirst()) {
-                val id = it.getLong(0)
-                val uri = ContentUris.withAppendedId(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    id
-                )
+        if (topFrames.size > maxTopFrames) {
+            topFrames.removeAt(topFrames.lastIndex)
+        }
 
-                val bitmap =
-                    if (Build.VERSION.SDK_INT >= 29) {
-                        ImageDecoder.decodeBitmap(
-                            ImageDecoder.createSource(
-                                context.contentResolver,
-                                uri
-                            )
-                        )
-                    } else {
-                        MediaStore.Images.Media.getBitmap(
-                            context.contentResolver,
-                            uri
-                        )
+        // 2️⃣ Проверяем adaptive cooldown
+        val now = System.currentTimeMillis()
+        val adaptiveCooldown = (baseCooldown / (score / lastSavedScore)).toLong().coerceAtLeast(1000L)
+
+        if (now - lastSavedTime < adaptiveCooldown) return
+
+        // 3️⃣ Сохраняем лучший кадр в галерею
+        val topFrame = topFrames.first()
+        saveBitmapToGallery(topFrame.first)
+
+        lastSavedTime = now
+        lastSavedScore = topFrame.second
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val filename = "AutoPose_${System.currentTimeMillis()}.jpg"
+
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH,
+                            Environment.DIRECTORY_PICTURES + "/AutoPose")
                     }
+                }
 
-                _uiState.value = _uiState.value.copy(
-                    lastGalleryBitmap = bitmap
-                )
+                val uri = appContext.contentResolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    contentValues
+                ) ?: return@launch
+
+                appContext.contentResolver.openOutputStream(uri)?.use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }
 
-    // =======================
-    // Save frames
-    // =======================
-
-    fun saveTopFramesToGallery() {
-        val resolver = getApplication<Application>().contentResolver
-
-        topFrames.forEachIndexed { index, scored ->
-            val values = ContentValues().apply {
-                put(
-                    MediaStore.Images.Media.DISPLAY_NAME,
-                    "best_pose_${System.currentTimeMillis()}_$index.jpg"
-                )
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                if (Build.VERSION.SDK_INT >= 29) {
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-            }
-
-            val uri = resolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values
-            )
-
-            uri?.let {
-                resolver.openOutputStream(it)?.use { out ->
-                    scored.bitmap.compress(
-                        Bitmap.CompressFormat.JPEG,
-                        95,
-                        out
-                    )
-                }
-
-                if (Build.VERSION.SDK_INT >= 29) {
-                    values.clear()
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    resolver.update(it, values, null, null)
-                }
-            }
-        }
-
-        topFrames.clear()
-    }
-
-    // =======================
-    // Cleanup
-    // =======================
 
     override fun onCleared() {
+        super.onCleared()
         cameraExecutor.shutdown()
         poseHelper.clearPoseLandmarker()
         aestheticPredictor.close()

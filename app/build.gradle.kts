@@ -77,4 +77,9 @@ dependencies {
 
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
+    // Compose + Lifecycle
+    implementation(libs.compose.lifecycle.runtime)
+
+    // Optional: LiveData support
+    implementation(libs.compose.runtime.livedata)
 }

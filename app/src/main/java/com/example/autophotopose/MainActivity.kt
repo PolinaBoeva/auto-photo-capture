@@ -32,13 +32,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val uiState by cameraViewModel.uiState.collectAsState()
 
-            CameraScreen(
-                isCaptureActive = uiState.isCaptureActive,
-                bestScore = uiState.bestScore,
-                onCaptureClick = { cameraViewModel.toggleCapture() },
-                onSwitchCameraClick = { cameraViewModel.switchCamera() },
-                onGalleryClick = { cameraViewModel.saveTopFramesToGallery() }
-            )
+            CameraScreen(viewModel = cameraViewModel)
         }
     }
 
