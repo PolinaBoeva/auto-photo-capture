@@ -22,9 +22,8 @@ class PoseLandmarkerHelper(
     var currentDelegate: Int = DELEGATE_CPU,
     var runningMode: RunningMode = RunningMode.IMAGE,
     val context: Context,
-    val poseLandmarkerHelperListener: LandmarkerListener? = null
+    val poseLandmarkerHelperListener: LandmarkerListener? = null,
 ) {
-
     private var poseLandmarker: PoseLandmarker? = null
 
     // последний кадр
@@ -49,20 +48,22 @@ class PoseLandmarkerHelper(
             DELEGATE_GPU -> baseOptionBuilder.setDelegate(Delegate.GPU)
         }
 
-        val modelName = when (currentModel) {
-            MODEL_POSE_LANDMARKER_LITE -> "pose_landmarker_lite.task"
-            MODEL_POSE_LANDMARKER_HEAVY -> "pose_landmarker_heavy.task"
-            else -> "pose_landmarker_full.task"
-        }
+        val modelName =
+            when (currentModel) {
+                MODEL_POSE_LANDMARKER_LITE -> "pose_landmarker_lite.task"
+                MODEL_POSE_LANDMARKER_HEAVY -> "pose_landmarker_heavy.task"
+                else -> "pose_landmarker_full.task"
+            }
 
         baseOptionBuilder.setModelAssetPath(modelName)
 
-        val optionsBuilder = PoseLandmarker.PoseLandmarkerOptions.builder()
-            .setBaseOptions(baseOptionBuilder.build())
-            .setMinPoseDetectionConfidence(minPoseDetectionConfidence)
-            .setMinTrackingConfidence(minPoseTrackingConfidence)
-            .setMinPosePresenceConfidence(minPosePresenceConfidence)
-            .setRunningMode(runningMode)
+        val optionsBuilder =
+            PoseLandmarker.PoseLandmarkerOptions.builder()
+                .setBaseOptions(baseOptionBuilder.build())
+                .setMinPoseDetectionConfidence(minPoseDetectionConfidence)
+                .setMinTrackingConfidence(minPoseTrackingConfidence)
+                .setMinPosePresenceConfidence(minPosePresenceConfidence)
+                .setRunningMode(runningMode)
 
         if (runningMode == RunningMode.LIVE_STREAM) {
             optionsBuilder
@@ -70,47 +71,54 @@ class PoseLandmarkerHelper(
                 .setErrorListener(this::returnLivestreamError)
         }
 
-        poseLandmarker = PoseLandmarker.createFromOptions(
-            context,
-            optionsBuilder.build()
-        )
+        poseLandmarker =
+            PoseLandmarker.createFromOptions(
+                context,
+                optionsBuilder.build(),
+            )
     }
 
     /**
      * LIVE_STREAM
      */
-    fun detectLiveStream(imageProxy: ImageProxy, isFrontCamera: Boolean) {
+    fun detectLiveStream(
+        imageProxy: ImageProxy,
+        isFrontCamera: Boolean,
+    ) {
         // Поменять на KTX формат!
-        val bitmapBuffer = Bitmap.createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888
-        )
+        val bitmapBuffer =
+            Bitmap.createBitmap(
+                imageProxy.width,
+                imageProxy.height,
+                Bitmap.Config.ARGB_8888,
+            )
 
         bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
         imageProxy.close()
 
-        val matrix = Matrix().apply {
-            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-            if (isFrontCamera) {
-                postScale(
-                    -1f,
-                    1f,
-                    bitmapBuffer.width.toFloat(),
-                    bitmapBuffer.height.toFloat()
-                )
+        val matrix =
+            Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                if (isFrontCamera) {
+                    postScale(
+                        -1f,
+                        1f,
+                        bitmapBuffer.width.toFloat(),
+                        bitmapBuffer.height.toFloat(),
+                    )
+                }
             }
-        }
 
-        val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer,
-            0,
-            0,
-            bitmapBuffer.width,
-            bitmapBuffer.height,
-            matrix,
-            true
-        )
+        val rotatedBitmap =
+            Bitmap.createBitmap(
+                bitmapBuffer,
+                0,
+                0,
+                bitmapBuffer.width,
+                bitmapBuffer.height,
+                matrix,
+                true,
+            )
 
         lastFrameBitmap = rotatedBitmap
 
@@ -119,13 +127,16 @@ class PoseLandmarkerHelper(
     }
 
     @VisibleForTesting
-    fun detectAsync(mpImage: MPImage, frameTime: Long) {
+    fun detectAsync(
+        mpImage: MPImage,
+        frameTime: Long,
+    ) {
         poseLandmarker?.detectAsync(mpImage, frameTime)
     }
 
     private fun returnLivestreamResult(
         result: PoseLandmarkerResult,
-        input: MPImage
+        input: MPImage,
     ) {
         val inferenceTime = SystemClock.uptimeMillis() - result.timestampMs()
         poseLandmarkerHelperListener?.onResults(
@@ -133,8 +144,8 @@ class PoseLandmarkerHelper(
                 listOf(result),
                 inferenceTime,
                 input.height,
-                input.width
-            )
+                input.width,
+            ),
         )
     }
 
@@ -163,7 +174,11 @@ class PoseLandmarkerHelper(
     )
 
     interface LandmarkerListener {
-        fun onError(error: String, errorCode: Int = 0)
+        fun onError(
+            error: String,
+            errorCode: Int = 0,
+        )
+
         fun onResults(resultBundle: ResultBundle)
     }
 }

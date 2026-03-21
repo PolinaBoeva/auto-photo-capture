@@ -14,16 +14,16 @@ import androidx.lifecycle.ViewModelProvider
 import com.example.autophotopose.ui.CameraScreen
 
 class MainActivity : ComponentActivity() {
-
     private lateinit var cameraViewModel: CameraViewModel
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        cameraViewModel = ViewModelProvider(
-            this,
-            ViewModelProvider.AndroidViewModelFactory.getInstance(application)
-        )[CameraViewModel::class.java]
+        cameraViewModel =
+            ViewModelProvider(
+                this,
+                ViewModelProvider.AndroidViewModelFactory.getInstance(application),
+            )[CameraViewModel::class.java]
 
         if (!allPermissionsGranted()) {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
@@ -46,5 +46,5 @@ class MainActivity : ComponentActivity() {
 
     private fun allPermissionsGranted(): Boolean =
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
-                PackageManager.PERMISSION_GRANTED
+            PackageManager.PERMISSION_GRANTED
 }

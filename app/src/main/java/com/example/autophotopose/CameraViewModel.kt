@@ -7,9 +7,15 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
@@ -17,20 +23,14 @@ import androidx.lifecycle.viewModelScope
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.examples.poselandmarker.PoseLandmarkerHelper
 import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
-
     // UI state
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState
@@ -53,8 +53,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     // Adaptive cooldown
     private var lastSavedTime = 0L
-    private var lastSavedScore = 5f       // начальное значение
-    private val baseCooldown = 5000L      // 5 секунд
+    private var lastSavedScore = 5f // начальное значение
+    private val baseCooldown = 5000L // 5 секунд
     private var isCapturing = false
 
     // Live pose results для Compose
@@ -62,52 +62,67 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     init {
-        poseHelper = PoseLandmarkerHelper(
-            context = application,
-            runningMode = RunningMode.LIVE_STREAM,
-            poseLandmarkerHelperListener = object : PoseLandmarkerHelper.LandmarkerListener {
-                override fun onError(error: String, errorCode: Int) {
-                    Log.e("PoseLandmarker", error)
-                }
+        poseHelper =
+            PoseLandmarkerHelper(
+                context = application,
+                runningMode = RunningMode.LIVE_STREAM,
+                poseLandmarkerHelperListener =
+                    object : PoseLandmarkerHelper.LandmarkerListener {
+                        override fun onError(
+                            error: String,
+                            errorCode: Int,
+                        ) {
+                            Log.e("PoseLandmarker", error)
+                        }
 
-                override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
-                    poseResults = resultBundle
+                        override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+                            poseResults = resultBundle
 
-                    if (_uiState.value.isCaptureActive && !isCapturing) {
-                        isCapturing = true
+                            if (_uiState.value.isCaptureActive && !isCapturing) {
+                                isCapturing = true
 
-                        // Берём последний bitmap из PoseLandmarkerHelper
-                        val bitmap = poseHelper.lastFrameBitmap
-                        bitmap?.let { evaluateAndStoreTopFrame(it) }
+                                // Берём последний bitmap из PoseLandmarkerHelper
+                                val bitmap = poseHelper.lastFrameBitmap
+                                bitmap?.let { evaluateAndStoreTopFrame(it) }
 
-                        isCapturing = false
-                    }
-                }
-            }
-        )
+                                isCapturing = false
+                            }
+                        }
+                    },
+            )
     }
 
     // =========================
     // Camera binding
     // =========================
-    fun bindCamera(previewView: PreviewView, lifecycleOwner: LifecycleOwner) {
+    fun bindCamera(
+        previewView: PreviewView,
+        lifecycleOwner: LifecycleOwner,
+    ) {
         if (!::imageCapture.isInitialized) createImageCapture()
         if (!::imageAnalysis.isInitialized) createImageAnalysis()
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(previewView.context)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build().apply {
-                setSurfaceProvider(previewView.surfaceProvider)
-            }
-            val selector = if (_uiState.value.isFrontCamera)
-                CameraSelector.DEFAULT_FRONT_CAMERA
-            else
-                CameraSelector.DEFAULT_BACK_CAMERA
+            val preview =
+                Preview.Builder().build().apply {
+                    setSurfaceProvider(previewView.surfaceProvider)
+                }
+            val selector =
+                if (_uiState.value.isFrontCamera) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
 
             cameraProvider.unbindAll()
             cameraProvider.bindToLifecycle(
-                lifecycleOwner, selector, preview, imageCapture, imageAnalysis
+                lifecycleOwner,
+                selector,
+                preview,
+                imageCapture,
+                imageAnalysis,
             )
         }, ContextCompat.getMainExecutor(previewView.context))
     }
@@ -121,7 +136,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                     poseHelper.detectLiveStream(
                         imageProxy,
-                        isFrontCamera = _uiState.value.isFrontCamera
+                        isFrontCamera = _uiState.value.isFrontCamera,
                     )
                 }
             }.also { imageAnalysis = it }
@@ -136,20 +151,22 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // UI actions
     // =========================
     fun toggleCapture() {
-        _uiState.value = _uiState.value.copy(
-            isCaptureActive = !_uiState.value.isCaptureActive
-        )
+        _uiState.value =
+            _uiState.value.copy(
+                isCaptureActive = !_uiState.value.isCaptureActive,
+            )
     }
 
     fun switchCamera() {
-        _uiState.value = _uiState.value.copy(
-            isFrontCamera = !_uiState.value.isFrontCamera
-        )
+        _uiState.value =
+            _uiState.value.copy(
+                isFrontCamera = !_uiState.value.isFrontCamera,
+            )
     }
 
     private fun getPersonRoi(
         bitmap: Bitmap,
-        resultBundle: PoseLandmarkerHelper.ResultBundle?
+        resultBundle: PoseLandmarkerHelper.ResultBundle?,
     ): android.graphics.Rect? {
         val results = resultBundle?.results ?: return null
         val firstResult = results.firstOrNull() ?: return null
@@ -221,30 +238,32 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 val filename = "AutoPose_${System.currentTimeMillis()}.jpg"
 
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        put(MediaStore.Images.Media.RELATIVE_PATH,
-                            Environment.DIRECTORY_PICTURES + "/AutoPose")
+                val contentValues =
+                    ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            put(
+                                MediaStore.Images.Media.RELATIVE_PATH,
+                                Environment.DIRECTORY_PICTURES + "/AutoPose",
+                            )
+                        }
                     }
-                }
 
-                val uri = appContext.contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    contentValues
-                ) ?: return@launch
+                val uri =
+                    appContext.contentResolver.insert(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        contentValues,
+                    ) ?: return@launch
 
                 appContext.contentResolver.openOutputStream(uri)?.use { out ->
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
                 }
-
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
     }
-
 
     override fun onCleared() {
         super.onCleared()

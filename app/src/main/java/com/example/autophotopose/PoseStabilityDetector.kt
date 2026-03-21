@@ -8,9 +8,8 @@ data class Landmark(val x: Float, val y: Float)
 class PoseStabilityDetector(
     private val bufferSize: Int = 15,
     private val threshold: Float = 0.02f,
-    private val stableFramesNeeded: Int = 5
+    private val stableFramesNeeded: Int = 5,
 ) {
-
     private val frameBuffer = Array<Bitmap?>(bufferSize) { null }
     private var bufferIndex = 0
 
@@ -21,7 +20,10 @@ class PoseStabilityDetector(
     var onStablePose: ((List<Bitmap>) -> Unit)? = null
 
     /** Добавляем новый кадр и его ключевые точки */
-    fun pushFrame(frame: Bitmap, landmarks: List<Landmark>) {
+    fun pushFrame(
+        frame: Bitmap,
+        landmarks: List<Landmark>,
+    ) {
         frameBuffer[bufferIndex] = frame
         bufferIndex = (bufferIndex + 1) % bufferSize
 
@@ -54,7 +56,10 @@ class PoseStabilityDetector(
     }
 
     /** Среднеквадратичное изменение L2 между точками */
-    private fun calcLandmarksDelta(prev: List<Landmark>, curr: List<Landmark>): Float {
+    private fun calcLandmarksDelta(
+        prev: List<Landmark>,
+        curr: List<Landmark>,
+    ): Float {
         if (prev.size != curr.size) return Float.MAX_VALUE
         var sum = 0f
         for (i in curr.indices) {
@@ -65,4 +70,3 @@ class PoseStabilityDetector(
         return sqrt(sum / curr.size)
     }
 }
-

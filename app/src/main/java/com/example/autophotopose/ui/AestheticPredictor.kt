@@ -2,7 +2,6 @@ package com.example.autophotopose
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.io.IOException
@@ -11,7 +10,6 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 
 class AestheticPredictor(private val context: Context) {
-
     private var interpreter: Interpreter
 
     init {
@@ -31,7 +29,7 @@ class AestheticPredictor(private val context: Context) {
 
     // Преобразуем Bitmap в input tensor
     private fun bitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val inputSize = 224  // Размер для MobileNet
+        val inputSize = 224 // Размер для MobileNet
         val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
 
         val byteBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4) // float32
