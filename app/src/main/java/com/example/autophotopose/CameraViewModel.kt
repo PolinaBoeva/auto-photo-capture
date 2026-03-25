@@ -11,6 +11,8 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.runtime.getValue
@@ -61,6 +63,27 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     var poseResults by mutableStateOf<PoseLandmarkerHelper.ResultBundle?>(null)
         private set
 
+    private fun isValidPose(resultBundle: PoseLandmarkerHelper.ResultBundle): Boolean {
+        val result = resultBundle.results.firstOrNull() ?: return false
+        val landmarks = result.landmarks()?.firstOrNull() ?: return false
+
+        val validPoints =
+            landmarks.count { landmark ->
+                val visibility = landmark.visibility().orElse(0f)
+                visibility > 0.6f
+            }
+
+        val xs = landmarks.map { it.x() }
+        val ys = landmarks.map { it.y() }
+
+        val width = (xs.maxOrNull() ?: 0f) - (xs.minOrNull() ?: 0f)
+        val height = (ys.maxOrNull() ?: 0f) - (ys.minOrNull() ?: 0f)
+
+        val isBigEnough = width > 0.2f && height > 0.3f
+
+        return validPoints >= 15 && isBigEnough
+    }
+
     init {
         poseHelper =
             PoseLandmarkerHelper(
@@ -78,10 +101,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
                             poseResults = resultBundle
 
-                            if (_uiState.value.isCaptureActive && !isCapturing) {
+                            val hasPerson = isValidPose(resultBundle)
+
+                            if (_uiState.value.isCaptureActive && !isCapturing && hasPerson) {
                                 isCapturing = true
 
-                                // Берём последний bitmap из PoseLandmarkerHelper
                                 val bitmap = poseHelper.lastFrameBitmap
                                 bitmap?.let { evaluateAndStoreTopFrame(it) }
 
@@ -143,7 +167,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun createImageCapture(): ImageCapture {
-        imageCapture = ImageCapture.Builder().build()
+        imageCapture =
+            ImageCapture.Builder()
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                        .setAllowedResolutionMode(
+                            ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE,
+                        )
+                        .build(),
+                )
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setJpegQuality(100)
+                .build()
+
         return imageCapture
     }
 
@@ -207,8 +244,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun evaluateAndStoreTopFrame(bitmap: Bitmap) {
-        val roiRect = getPersonRoi(bitmap, poseResults)
-        val roiBitmap = roiRect?.let { Bitmap.createBitmap(bitmap, it.left, it.top, it.width(), it.height()) } ?: bitmap
+        val roiRect = getPersonRoi(bitmap, poseResults) ?: return
+        val roiBitmap = Bitmap.createBitmap(bitmap, roiRect.left, roiRect.top, roiRect.width(), roiRect.height())
         val score = aestheticPredictor.predictAesthetic(roiBitmap)
 
         // 1️⃣ Добавляем в topFrames, если лучше существующих
