@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "AutoPhotoPose"
 include(":app")
+include(":opencv")

@@ -23,7 +23,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.example.autophotopose.ui.CameraUiState
-import com.google.mediapipe.examples.poselandmarker.PoseLandmarkerHelper
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,8 +56,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private var lastSavedTime = 0L
     private var lastSavedScore = 5f // начальное значение
     private val baseCooldown = 5000L // 5 секунд
-    private var isCapturing = false
-
     // Live pose results для Compose
     var poseResults by mutableStateOf<PoseLandmarkerHelper.ResultBundle?>(null)
         private set
@@ -67,21 +64,88 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val result = resultBundle.results.firstOrNull() ?: return false
         val landmarks = result.landmarks()?.firstOrNull() ?: return false
 
-        val validPoints =
-            landmarks.count { landmark ->
-                val visibility = landmark.visibility().orElse(0f)
-                visibility > 0.6f
-            }
+        if (landmarks.size < 15) return false
+
+        val reliablePoints = landmarks.count { landmark ->
+            landmark.visibility().orElse(0f) > 0.65f &&
+                landmark.presence().orElse(0f) > 0.55f
+        }
 
         val xs = landmarks.map { it.x() }
         val ys = landmarks.map { it.y() }
-
         val width = (xs.maxOrNull() ?: 0f) - (xs.minOrNull() ?: 0f)
         val height = (ys.maxOrNull() ?: 0f) - (ys.minOrNull() ?: 0f)
 
-        val isBigEnough = width > 0.2f && height > 0.3f
+        val isBigEnough = width > 0.22f && height > 0.30f
 
-        return validPoints >= 15 && isBigEnough
+        return reliablePoints >= 16 && isBigEnough
+    }
+
+    private val poseStabilityDetector = PoseStabilityDetector().apply {
+        onStablePose = { stableFrames ->
+            val bestFrame = stableFrames.last()
+
+            val isSharp = !isBlurred(bestFrame)
+            if (isSharp) {
+                evaluateAndStoreTopFrame(bestFrame)
+            }
+        }
+    }
+
+
+
+    private fun isBlurred(
+        bitmap: Bitmap,
+        threshold: Double = 100.0 // подбирается (пример: 80–150)
+    ): Boolean {
+        if (bitmap.width < 64 || bitmap.height < 64) return true
+
+        var mat: org.opencv.core.Mat? = null
+        var gray: org.opencv.core.Mat? = null
+        var gradX: org.opencv.core.Mat? = null
+        var gradY: org.opencv.core.Mat? = null
+        var magnitude: org.opencv.core.Mat? = null
+
+        try {
+            val targetWidth = 320
+            val targetHeight = (bitmap.height * (targetWidth.toFloat() / bitmap.width)).toInt().coerceAtLeast(1)
+
+            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+
+            mat = org.opencv.core.Mat()
+            org.opencv.android.Utils.bitmapToMat(resizedBitmap, mat)
+
+            // 🔹 grayscale
+            gray = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.cvtColor(
+                mat,
+                gray,
+                org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY
+            )
+
+            // 🔹 Sobel gradients
+            gradX = org.opencv.core.Mat()
+            gradY = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.Sobel(gray, gradX, org.opencv.core.CvType.CV_64F, 1, 0)
+            org.opencv.imgproc.Imgproc.Sobel(gray, gradY, org.opencv.core.CvType.CV_64F, 0, 1)
+
+            // 🔹 magnitude = sqrt(gx^2 + gy^2)
+            magnitude = org.opencv.core.Mat()
+            org.opencv.core.Core.magnitude(gradX, gradY, magnitude)
+
+            val mean = org.opencv.core.Core.mean(magnitude).`val`[0]
+            return mean < threshold
+
+        } catch (e: Exception) {
+            Log.e("BlurCheck", "Ошибка Tenengrad", e)
+            return true
+        } finally {
+            mat?.release()
+            gray?.release()
+            gradX?.release()
+            gradY?.release()
+            magnitude?.release()
+        }
     }
 
     init {
@@ -91,10 +155,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 runningMode = RunningMode.LIVE_STREAM,
                 poseLandmarkerHelperListener =
                     object : PoseLandmarkerHelper.LandmarkerListener {
-                        override fun onError(
-                            error: String,
-                            errorCode: Int,
-                        ) {
+                        override fun onError(error: String, errorCode: Int) {
                             Log.e("PoseLandmarker", error)
                         }
 
@@ -103,16 +164,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                             val hasPerson = isValidPose(resultBundle)
 
-                            if (_uiState.value.isCaptureActive && !isCapturing && hasPerson) {
-                                isCapturing = true
-
-                                val bitmap = poseHelper.lastFrameBitmap
-                                bitmap?.let { evaluateAndStoreTopFrame(it) }
-
-                                isCapturing = false
+                            if (_uiState.value.isCaptureActive && hasPerson) {
+                                val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull()
+                                if (!landmarksList.isNullOrEmpty()) {
+                                    val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
+                                    poseHelper.lastFrameBitmap?.let { bitmap ->
+                                        poseStabilityDetector.pushFrame(bitmap, landmarks)
+                                    }
+                                }
                             }
                         }
-                    },
+                    }
             )
     }
 
@@ -129,10 +191,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(previewView.context)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-            val preview =
-                Preview.Builder().build().apply {
-                    setSurfaceProvider(previewView.surfaceProvider)
-                }
+            val preview = Preview.Builder().build().apply {
+                surfaceProvider = previewView.surfaceProvider
+            }
             val selector =
                 if (_uiState.value.isFrontCamera) {
                     CameraSelector.DEFAULT_FRONT_CAMERA

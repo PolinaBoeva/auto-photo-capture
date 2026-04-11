@@ -1,4 +1,4 @@
-package com.google.mediapipe.examples.poselandmarker
+package com.example.autophotopose
 
 import android.content.Context
 import android.graphics.Bitmap
