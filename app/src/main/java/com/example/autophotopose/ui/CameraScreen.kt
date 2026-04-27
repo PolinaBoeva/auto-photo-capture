@@ -1,13 +1,13 @@
 package com.example.autophotopose.ui
 
+import android.content.Intent
+import android.provider.MediaStore
+import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -22,6 +22,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.autophotopose.CameraViewModel
 import com.example.autophotopose.OverlayView
 
+private const val TAG = "CameraScreen"
+
 @Composable
 fun CameraScreen(
     viewModel: CameraViewModel,
@@ -31,25 +33,33 @@ fun CameraScreen(
 
     val uiState by viewModel.uiState.collectAsState()
     val poseResults = viewModel.poseResults
+    val captureTrigger by viewModel.captureTrigger.collectAsState()
 
     val previewView = remember { PreviewView(context) }
-    val overlayView: OverlayView = remember { OverlayView(context) }
+    val overlayView = remember { OverlayView(context) }
 
-    // Bind camera on first composition or when switching front/back
+    // Changing the camera type (front/main)
     LaunchedEffect(uiState.isFrontCamera) {
+        Log.d(TAG, "Re-binding camera. Front: ${uiState.isFrontCamera}")
         viewModel.bindCamera(previewView, lifecycleOwner)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // ===== Camera Preview =====
-        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        AndroidView(
+            factory = { previewView },
+            modifier = Modifier.fillMaxSize(),
+        )
 
-        // ===== Overlay =====
-        AndroidView(factory = { overlayView }, modifier = Modifier.fillMaxSize())
+        // Overlay
+        AndroidView(
+            factory = { overlayView },
+            modifier = Modifier.fillMaxSize(),
+        )
 
-        // Update overlay when poseResults changes
+        // Pose update
         LaunchedEffect(poseResults) {
             poseResults?.let { result ->
+                Log.d(TAG, "Updating pose results in overlay")
                 overlayView.setResults(
                     results = result.results,
                     imageHeight = result.inputImageHeight,
@@ -58,29 +68,82 @@ fun CameraScreen(
             }
         }
 
-        // ===== UI Buttons =====
-        Column(
+        // Visual shooting signal
+        LaunchedEffect(captureTrigger) {
+            if (captureTrigger != 0) {
+                Log.d(TAG, "Triggering capture flash")
+                overlayView.triggerCaptureFlash()
+            }
+        }
+
+        // Control panel
+        ControlPanel(
             modifier =
                 Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(text = if (uiState.isCaptureActive) "Smart Capture ON" else "Smart Capture OFF")
-            uiState.bestScore?.let { score ->
-                Text(text = "Best score: ${"%.2f".format(score)}")
+                    .padding(bottom = 24.dp),
+            uiState = uiState,
+            onCaptureClick = { viewModel.toggleCapture() },
+            onSwitchCameraClick = { viewModel.switchCamera() },
+            onGalleryClick = { openGallery(context) },
+        )
+    }
+}
+
+@Composable
+private fun ControlPanel(
+    modifier: Modifier = Modifier,
+    uiState: CameraUiState,
+    onCaptureClick: () -> Unit,
+    onSwitchCameraClick: () -> Unit,
+    onGalleryClick: () -> Unit,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        CameraButtons(
+            isCaptureActive = uiState.isCaptureActive,
+            lastGalleryBitmap = uiState.lastGalleryBitmap,
+            onCaptureClick = onCaptureClick,
+            onSwitchCameraClick = onSwitchCameraClick,
+            onGalleryClick = onGalleryClick,
+        )
+    }
+}
+
+/**
+ * Opens the system gallery.
+ */
+private fun openGallery(context: android.content.Context) {
+    try {
+        // Try to open gallery with folder filter (works on some OEM galleries)
+        val intent =
+            Intent(Intent.ACTION_VIEW).apply {
+                type = "vnd.android.cursor.dir/image"
+                putExtra("bucket", "AutoPose")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
-
-            CameraButtons(
-                isCaptureActive = uiState.isCaptureActive,
-                bestScore = uiState.bestScore,
-                lastGalleryBitmap = uiState.lastGalleryBitmap,
-                onCaptureClick = { viewModel.toggleCapture() },
-                onSwitchCameraClick = { viewModel.switchCamera() },
-                onGalleryClick = { /* TODO: открыть галерею */ },
-            )
+        if (intent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(intent)
+            Log.d(TAG, "Opened gallery with bucket filter")
+            return
         }
+
+        // Fallback: standard image picker
+        val galleryIntent =
+            Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+        if (galleryIntent.resolveActivity(context.packageManager) != null) {
+            context.startActivity(galleryIntent)
+            Log.d(TAG, "Opened default gallery picker")
+        } else {
+            Log.w(TAG, "No gallery app found")
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to open gallery", e)
     }
 }

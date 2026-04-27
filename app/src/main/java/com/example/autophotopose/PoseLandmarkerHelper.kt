@@ -4,8 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.SystemClock
-import androidx.annotation.VisibleForTesting
+import android.util.Log
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageProxy
+import androidx.core.graphics.createBitmap
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -24,9 +26,26 @@ class PoseLandmarkerHelper(
     val context: Context,
     val poseLandmarkerHelperListener: LandmarkerListener? = null,
 ) {
+    companion object {
+        private const val TAG = "PoseLandmarker"
+
+        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.5f
+        const val DEFAULT_POSE_TRACKING_CONFIDENCE = 0.5f
+        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.5f
+
+        const val DELEGATE_CPU = 0
+        const val DELEGATE_GPU = 1
+
+        const val MODEL_POSE_LANDMARKER_FULL = 0
+        const val MODEL_POSE_LANDMARKER_LITE = 1
+        const val MODEL_POSE_LANDMARKER_HEAVY = 2
+    }
+
     private var poseLandmarker: PoseLandmarker? = null
 
-    // последний кадр
+    /**
+     * Last processed frame bitmap for use in AutoCaptureProcessor.
+     */
     @Volatile
     var lastFrameBitmap: Bitmap? = null
         private set
@@ -36,16 +55,24 @@ class PoseLandmarkerHelper(
     }
 
     fun clearPoseLandmarker() {
+        Log.d(TAG, "Closing PoseLandmarker")
         poseLandmarker?.close()
         poseLandmarker = null
+        lastFrameBitmap = null
     }
 
     fun setupPoseLandmarker() {
+        Log.d(TAG, "Setting up PoseLandmarker. Model: $currentModel, Delegate: $currentDelegate")
+
         val baseOptionBuilder = BaseOptions.builder()
 
         when (currentDelegate) {
             DELEGATE_CPU -> baseOptionBuilder.setDelegate(Delegate.CPU)
             DELEGATE_GPU -> baseOptionBuilder.setDelegate(Delegate.GPU)
+            else -> {
+                Log.w(TAG, "Unknown delegate ($currentDelegate), falling back to CPU")
+                baseOptionBuilder.setDelegate(Delegate.CPU)
+            }
         }
 
         val modelName =
@@ -57,81 +84,89 @@ class PoseLandmarkerHelper(
 
         baseOptionBuilder.setModelAssetPath(modelName)
 
-        val optionsBuilder =
-            PoseLandmarker.PoseLandmarkerOptions.builder()
-                .setBaseOptions(baseOptionBuilder.build())
-                .setMinPoseDetectionConfidence(minPoseDetectionConfidence)
-                .setMinTrackingConfidence(minPoseTrackingConfidence)
-                .setMinPosePresenceConfidence(minPosePresenceConfidence)
-                .setRunningMode(runningMode)
+        try {
+            val optionsBuilder =
+                PoseLandmarker.PoseLandmarkerOptions.builder()
+                    .setBaseOptions(baseOptionBuilder.build())
+                    .setMinPoseDetectionConfidence(minPoseDetectionConfidence)
+                    .setMinTrackingConfidence(minPoseTrackingConfidence)
+                    .setMinPosePresenceConfidence(minPosePresenceConfidence)
+                    .setRunningMode(runningMode)
 
-        if (runningMode == RunningMode.LIVE_STREAM) {
-            optionsBuilder
-                .setResultListener(this::returnLivestreamResult)
-                .setErrorListener(this::returnLivestreamError)
+            if (runningMode == RunningMode.LIVE_STREAM) {
+                optionsBuilder
+                    .setResultListener(this::returnLivestreamResult)
+                    .setErrorListener(this::returnLivestreamError)
+            }
+
+            poseLandmarker =
+                PoseLandmarker.createFromOptions(
+                    context,
+                    optionsBuilder.build(),
+                )
+            Log.d(TAG, "PoseLandmarker initialized successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize PoseLandmarker", e)
+            poseLandmarkerHelperListener?.onError("Initialization failed: ${e.message}")
         }
-
-        poseLandmarker =
-            PoseLandmarker.createFromOptions(
-                context,
-                optionsBuilder.build(),
-            )
     }
 
     /**
-     * LIVE_STREAM
+     * Processes ImageProxy from CameraX.
+     * Converts to Bitmap, applies rotation/mirror, and sends to MediaPipe.
      */
+    @androidx.annotation.OptIn(ExperimentalGetImage::class)
     fun detectLiveStream(
         imageProxy: ImageProxy,
         isFrontCamera: Boolean,
     ) {
-        // Поменять на KTX формат!
-        val bitmapBuffer =
-            Bitmap.createBitmap(
-                imageProxy.width,
-                imageProxy.height,
-                Bitmap.Config.ARGB_8888,
-            )
+        val startTime = SystemClock.uptimeMillis()
 
+        // 1. Convert ImageProxy to Bitmap using KTX function
+        val bitmapBuffer = createBitmap(
+            imageProxy.width,
+            imageProxy.height,
+            Bitmap.Config.ARGB_8888,
+        )
         bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
-        imageProxy.close()
 
-        val matrix =
-            Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-                if (isFrontCamera) {
-                    postScale(
-                        -1f,
-                        1f,
-                        bitmapBuffer.width.toFloat(),
-                        bitmapBuffer.height.toFloat(),
-                    )
-                }
+        // 2. Apply rotation and mirroring
+        val matrix = Matrix().apply {
+            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            if (isFrontCamera) {
+                // Mirror horizontally around the center
+                postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
             }
+        }
 
-        val rotatedBitmap =
-            Bitmap.createBitmap(
-                bitmapBuffer,
-                0,
-                0,
-                bitmapBuffer.width,
-                bitmapBuffer.height,
-                matrix,
-                true,
-            )
+        val rotatedBitmap = Bitmap.createBitmap(
+            bitmapBuffer,
+            0,
+            0,
+            bitmapBuffer.width,
+            bitmapBuffer.height,
+            matrix,
+            true,
+        )
 
+        // Recycle temporary buffer immediately
+        bitmapBuffer.recycle()
         lastFrameBitmap = rotatedBitmap
 
-        val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-        detectAsync(mpImage, SystemClock.uptimeMillis())
-    }
+        try {
+            // 3. Create MPImage from Bitmap and send to MediaPipe
+            val mpImage = BitmapImageBuilder(rotatedBitmap).build()
+            poseLandmarker?.detectAsync(mpImage, startTime)
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaPipe processing failed", e)
+        } finally {
+            imageProxy.close()
+        }
 
-    @VisibleForTesting
-    fun detectAsync(
-        mpImage: MPImage,
-        frameTime: Long,
-    ) {
-        poseLandmarker?.detectAsync(mpImage, frameTime)
+        val processingTime = SystemClock.uptimeMillis() - startTime
+        if (processingTime > 50) {
+            Log.w(TAG, "Slow frame pipeline: ${processingTime}ms")
+        }
     }
 
     private fun returnLivestreamResult(
@@ -139,6 +174,7 @@ class PoseLandmarkerHelper(
         input: MPImage,
     ) {
         val inferenceTime = SystemClock.uptimeMillis() - result.timestampMs()
+
         poseLandmarkerHelperListener?.onResults(
             ResultBundle(
                 listOf(result),
@@ -150,20 +186,8 @@ class PoseLandmarkerHelper(
     }
 
     private fun returnLivestreamError(error: RuntimeException) {
-        poseLandmarkerHelperListener?.onError(error.message ?: "Unknown error")
-    }
-
-    companion object {
-        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.5f
-        const val DEFAULT_POSE_TRACKING_CONFIDENCE = 0.5f
-        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.5f
-
-        const val DELEGATE_CPU = 0
-        const val DELEGATE_GPU = 1
-
-        const val MODEL_POSE_LANDMARKER_FULL = 0
-        const val MODEL_POSE_LANDMARKER_LITE = 1
-        const val MODEL_POSE_LANDMARKER_HEAVY = 2
+        Log.e(TAG, "MediaPipe error: ${error.message}")
+        poseLandmarkerHelperListener?.onError(error.message ?: "Unknown MediaPipe error")
     }
 
     data class ResultBundle(

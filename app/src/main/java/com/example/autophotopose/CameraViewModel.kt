@@ -3,173 +3,142 @@ package com.example.autophotopose
 import android.app.Application
 import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalZeroShutterLag
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.*
+import androidx.core.graphics.scale
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.viewModelScope
+import com.example.autophotopose.ui.AestheticPredictor
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.hypot
-import android.graphics.Rect
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import androidx.camera.core.ExperimentalZeroShutterLag
-import android.graphics.BitmapFactory
-import android.graphics.Matrix
 
 class CameraViewModel(application: Application) : AndroidViewModel(application) {
+    companion object {
+        private const val TAG = "CameraVM"
+        private const val FOLDER_NAME = "AutoPose"
+        private const val PREVIEW_SIZE = 300
+        private const val JPEG_QUALITY_HIGH = 100
+        private const val JPEG_QUALITY_SAVE = 95
+    }
 
-    // ========================= UI =========================
+    // ========================= UI STATE =========================
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState
-    private val appContext = getApplication<Application>()
 
-    // ========================= ML =========================
-    private val aestheticPredictor = AestheticPredictor(appContext)
-    private val poseHelper: PoseLandmarkerHelper
+    private val _captureTrigger = MutableStateFlow(0)
+    val captureTrigger: StateFlow<Int> = _captureTrigger
 
-    // ========================= CameraX =========================
-    private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private lateinit var imageAnalysis: ImageAnalysis
-    private lateinit var imageCapture: ImageCapture
-
-    // ========================= BUFFER =========================
-    private val analysisBuffer = ArrayDeque<AnalysisFrame>(40)
-    private var lastLandmarks: List<Landmark>? = null
-    private data class AnalysisFrame(
-        val timestamp: Long,
-        val score: Float,
-        val velocity: Float,
-        val isBlur: Boolean,
-        val landmarks: List<Landmark>
-    )
-
-    // ========================= STATE =========================
-    private var lastSavedTime = 0L
-    private var lastSavedScore = 5f
-    private var isCapturing = false
-    private var lastTriggerTime = 0L
-
-    // ========================= TUNING =========================
-    private val minStableMs = 300L
-    private val poseChangeThreshold = 0.6f        // повысили
-    private val stableVelocityThreshold = 0.45f   // главный фикс
-    private val peakRatio = 0.92f
-    private val targetDelayMs = 80L
-    private val bufferWindowMs = 1200L             // чуть больше окна
-    // ========================= OUTPUT =========================
     var poseResults by mutableStateOf<PoseLandmarkerHelper.ResultBundle?>(null)
         private set
 
-    private fun isBlurred(bitmap: Bitmap, threshold: Double = 100.0): Boolean {
-        Log.d("BLUR", "Blur check SKIPPED → returning false (safe stub)")
-        return false
-    }
+    private val appContext = getApplication<Application>()
 
-    // ========================= INIT =========================
+    // ========================= ML & PROCESSING =========================
+    private val aestheticPredictor = AestheticPredictor(appContext)
+    private lateinit var poseHelper: PoseLandmarkerHelper
+    private lateinit var captureProcessor: AutoCaptureProcessor
+
+    // ========================= CAMERA X =========================
+    private val cameraExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor {
+            Thread(it, "CameraAnalysis").apply { isDaemon = true }
+        }
+
+    private lateinit var imageAnalysis: ImageAnalysis
+    private lateinit var imageCapture: ImageCapture
+
+    // ========================= INITIALIZATION =========================
     init {
-        poseHelper = PoseLandmarkerHelper(
-            context = application,
-            runningMode = RunningMode.LIVE_STREAM,
-            poseLandmarkerHelperListener = object : PoseLandmarkerHelper.LandmarkerListener {
-                override fun onError(error: String, errorCode: Int) {
-                    Log.e("PoseLandmarker", error)
-                }
-
-                override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
-                    Log.d("POSE", "onResults received | hasPose=${resultBundle.results.isNotEmpty()}")
-                    poseResults = resultBundle
-                    if (!_uiState.value.isCaptureActive) {
-                        Log.d("POSE", "Capture inactive → skip")
-                        return
-                    }
-
-                    if (!isValidPose(resultBundle)) {
-                        Log.d("POSE", "isValidPose() = false → skip")
-                        return
-                    }
-
-                    val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return
-                    val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
-                    val bitmap = poseHelper.lastFrameBitmap
-                    if (bitmap == null) {
-                        Log.w("POSE", "lastFrameBitmap is null → cannot process")
-                        return
-                    }
-                    Log.d("POSE", "Valid pose detected | landmarks=${landmarks.size}, bitmap=${bitmap.width}x${bitmap.height}")
-
-
-                    val velocity = calculateVelocity(landmarks, lastLandmarks)
-
-                    Log.d("POSE", "velocity=${velocity.format(3)} | threshold=$poseChangeThreshold")
-
-                    if (velocity > poseChangeThreshold) {
-                        analysisBuffer.clear()
-                        Log.d("POSE", "NEW POSE detected → buffer cleared")
-                        lastLandmarks = landmarks
-                        return
-                    }
-
-                    val roiRect = getPersonRoi(bitmap, resultBundle)
-
-                    if (roiRect == null) {
-                        Log.w("POSE", "getPersonRoi returned null")
-                        return
-                    }
-
-                    val roiBitmap = Bitmap.createBitmap(
-                        bitmap, roiRect.left, roiRect.top, roiRect.width(), roiRect.height()
-                    )
-
-                    val score = aestheticPredictor.predictAesthetic(roiBitmap)
-                    Log.d("POSE", "ROI created | score=${score.format(2)}")
-                    val blur = isBlurred(roiBitmap)
-                    roiBitmap.recycle()
-
-                    val now = System.currentTimeMillis()
-                    analysisBuffer.addLast(
-                        AnalysisFrame(now, score, velocity, blur, landmarks)
-                    )
-
-                    trimBuffer(now)
-
-                    if (shouldTrigger()) {
-                        triggerCapture()
-                    }
-
-                    Log.d("BUFFER", "size=${analysisBuffer.size}, score=$score, vel=$velocity")
-                }
-            }
-        )
+        Log.d(TAG, "Initializing ViewModel")
+        initializeMLComponents()
+        loadLastPhotoFromGallery()
     }
 
-    // ========================= CAMERA =========================
-    fun bindCamera(previewView: PreviewView, lifecycleOwner: LifecycleOwner) {
+    private fun initializeMLComponents() {
+        poseHelper =
+            PoseLandmarkerHelper(
+                context = appContext,
+                runningMode = RunningMode.LIVE_STREAM,
+                poseLandmarkerHelperListener =
+                    object : PoseLandmarkerHelper.LandmarkerListener {
+                        override fun onError(
+                            error: String,
+                            errorCode: Int,
+                        ) {
+                            Log.e(TAG, "Pose Landmarker error [$errorCode]: $error")
+                        }
+
+                        override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+                            handlePoseResult(resultBundle)
+                        }
+                    },
+            )
+
+        captureProcessor =
+            AutoCaptureProcessor(
+                aestheticPredictor = aestheticPredictor,
+                onCaptureTriggered = { triggerCapture() },
+            )
+    }
+
+    // ========================= CAMERA BINDING =========================
+    fun bindCamera(
+        previewView: PreviewView,
+        lifecycleOwner: LifecycleOwner,
+    ) {
+        Log.d(TAG, "Binding camera to lifecycle owner")
+
         if (!::imageCapture.isInitialized) createImageCapture()
         if (!::imageAnalysis.isInitialized) createImageAnalysis()
 
         val future = ProcessCameraProvider.getInstance(previewView.context)
         future.addListener({
             val provider = future.get()
-            val preview = Preview.Builder().build().apply { surfaceProvider = previewView.surfaceProvider }
-            val selector = if (_uiState.value.isFrontCamera)
-                CameraSelector.DEFAULT_FRONT_CAMERA
-            else
-                CameraSelector.DEFAULT_BACK_CAMERA
 
-            provider.unbindAll()
-            provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture, imageAnalysis)
+            val preview =
+                Preview.Builder().build().apply {
+                    surfaceProvider = previewView.surfaceProvider
+                }
+
+            val cameraSelector =
+                if (_uiState.value.isFrontCamera) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
+
+            try {
+                provider.unbindAll()
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageCapture, imageAnalysis)
+                Log.d(TAG, "Camera bound successfully. Front: ${_uiState.value.isFrontCamera}")
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
         }, ContextCompat.getMainExecutor(previewView.context))
     }
 
@@ -178,355 +147,329 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
-            .also { it.setAnalyzer(cameraExecutor) { proxy ->
-                poseHelper.detectLiveStream(proxy, _uiState.value.isFrontCamera)
-            }}.also { imageAnalysis = it }
+            .also { analysis ->
+                imageAnalysis = analysis
+                analysis.setAnalyzer(cameraExecutor) { proxy ->
+                    poseHelper.detectLiveStream(proxy, _uiState.value.isFrontCamera)
+                }
+            }
     }
 
     @androidx.annotation.OptIn(ExperimentalZeroShutterLag::class)
     private fun createImageCapture(): ImageCapture {
-        imageCapture = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG)
-            .setJpegQuality(100)
-            .build()
+        val captureMode =
+            if (_uiState.value.isFrontCamera) {
+                ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
+            } else {
+                ImageCapture.CAPTURE_MODE_ZERO_SHUTTER_LAG
+            }
+
+        imageCapture =
+            ImageCapture.Builder()
+                .setCaptureMode(captureMode)
+                .setJpegQuality(JPEG_QUALITY_HIGH)
+                .build()
+
+        Log.d(TAG, "ImageCapture created. Mode: $captureMode")
         return imageCapture
     }
 
-    // ========================= TRIGGER LOGIC =========================
-    private fun shouldTrigger(): Boolean {
-        val now = System.currentTimeMillis()
+    // ========================= LOGIC HANDLERS =========================
+    private fun handlePoseResult(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+        poseResults = resultBundle
 
-        if (analysisBuffer.size < 6 || isCapturing) {
-            Log.d("TRIGGER", "REJECTED: buffer=${analysisBuffer.size}, isCapturing=$isCapturing")
-            return false
-        }
+        if (!_uiState.value.isCaptureActive) return
 
-        val recent = analysisBuffer.takeLast(12)
-        if (recent.isEmpty()) {
-            Log.d("TRIGGER", "REJECTED: recent is empty")
-            return false
-        }
-
-        val currentFrame = recent.last()
-
-        Log.d(
-            "TRIGGER",
-            "START | buffer=${analysisBuffer.size}, recent=${recent.size}, " +
-                "vel=${currentFrame.velocity.format(3)}, blur=${currentFrame.isBlur}, score=${currentFrame.score.format(2)}"
-        )
-
-// 1. Стабильность окна
-        val stableCount = recent.count { it.velocity < stableVelocityThreshold }
-        val oldestTimestamp = recent.firstOrNull()?.timestamp ?: now
-        val windowDuration = now - oldestTimestamp
-        val stableRatio = stableCount.toFloat() / recent.size
-
-        val isStableEnough = (stableRatio >= 0.55f) && (windowDuration >= minStableMs)
-
-        Log.d("TRIGGER", "STABILITY | stable=$stableCount/${recent.size} (${stableRatio.format(2)}) duration=${windowDuration}ms | threshold=$stableVelocityThreshold | ok=$isStableEnough")
-        if (!isStableEnough) {
-            Log.d("TRIGGER", "REJECTED: not stable enough")
-            return false
-        }
-
-        // 2. Текущий кадр
-        val badVelocity = currentFrame.velocity > stableVelocityThreshold
-        val isBlur = currentFrame.isBlur
-
-        Log.d(
-            "TRIGGER",
-            "CURRENT FRAME | vel=${currentFrame.velocity.format(3)} " +
-                "blur=$isBlur badVelocity=$badVelocity"
-        )
-
-        if (badVelocity || isBlur) {
-            Log.d("TRIGGER", "REJECTED: current frame not good")
-            return false
-        }
-
-        // 3. Валидные кадры
-        val validFrames = recent.filter {
-            !it.isBlur && it.velocity < stableVelocityThreshold
-        }
-
-        Log.d("TRIGGER", "VALID FRAMES | ${validFrames.size}/12")
-
-        if (validFrames.size < 3) {
-            Log.d("TRIGGER", "REJECTED: not enough valid frames")
-            return false
-        }
-
-        // 4. Peak detection
-        val maxScore = validFrames.maxOf { it.score }
-        val prevScore = recent.getOrNull(recent.lastIndex - 1)?.score ?: 0f
-
-        val isPeak =
-            currentFrame.score >= maxScore * peakRatio &&
-                currentFrame.score >= prevScore - 0.04f
-
-        Log.d(
-            "TRIGGER",
-            "PEAK | current=${currentFrame.score.format(2)} " +
-                "max=${maxScore.format(2)} prev=${prevScore.format(2)} " +
-                "ok=$isPeak"
-        )
-
-        if (!isPeak) {
-            Log.d("TRIGGER", "REJECTED: not peak")
-            return false
-        }
-
-        // 5. Cooldown
-        val isBetterThanLast = currentFrame.score > lastSavedScore * 1.05f
-        val isHighQuality = currentFrame.score > 7.5f
-
-        val cooldown = if (isBetterThanLast || isHighQuality) 1800L else 3200L
-        val timeSinceLast = now - lastTriggerTime
-
-        Log.d(
-            "TRIGGER",
-            "COOLDOWN | since=$timeSinceLast ms required=$cooldown ms " +
-                "better=$isBetterThanLast high=$isHighQuality"
-        )
-
-        if (timeSinceLast < cooldown) {
-            Log.d("TRIGGER", "REJECTED: cooldown active")
-            return false
-        }
-
-        Log.d(
-            "TRIGGER",
-            "ACCEPTED 🎯 | score=${currentFrame.score.format(2)} " +
-                "vel=${currentFrame.velocity.format(3)}"
-        )
-
-        return true
-    }
-
-    fun Float.format(digits: Int): String = "%.${digits}f".format(this)
-    fun Double.format(digits: Int): String = "%.${digits}f".format(this)
-
-    private fun triggerCapture() {
-        if (isCapturing) {
-            Log.d("CAPTURE", "Already capturing → skip")
+        val bitmap = poseHelper.lastFrameBitmap
+        if (bitmap == null) {
+            Log.w(TAG, "Skipping frame: lastFrameBitmap is null")
             return
         }
 
-        Log.d("CAPTURE", "=== TRIGGERED === Starting capture with delay=${targetDelayMs}ms")
+        captureProcessor.processFrame(bitmap, resultBundle)
+    }
 
-        isCapturing = true
-        lastTriggerTime = System.currentTimeMillis()
+    private fun triggerCapture() {
+        if (!captureProcessor.isReady) {
+            Log.d(TAG, "Capture skipped: Processor not ready")
+            return
+        }
+
+        val delayMs = AutoCaptureProcessor.Config().targetDelayMs
+        Log.d(TAG, "=== CAPTURE TRIGGERED === (Delay: ${delayMs}ms)")
+
+        captureProcessor.notifyCaptureStarted()
+        _captureTrigger.value++
 
         viewModelScope.launch {
-            delay(targetDelayMs)
-            Log.d("CAPTURE", "Delay finished → calling takePicture()")
-            imageCapture.takePicture(cameraExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            delay(delayMs)
+            takePicture()
+        }
+    }
+
+    private fun takePicture() {
+        if (!::imageCapture.isInitialized) {
+            Log.e(TAG, "Cannot take picture: ImageCapture not initialized")
+            return
+        }
+
+        imageCapture.takePicture(
+            cameraExecutor,
+            object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
-                    Log.d("CAPTURE", "onCaptureSuccess | ${image.width}x${image.height}")
-
+                    Log.d(TAG, "Picture captured successfully. Processing...")
                     viewModelScope.launch(Dispatchers.IO) {
-                        try {
-                            // Прямое сохранение JPEG
-                            val jpegBytes = ByteArray(image.planes[0].buffer.remaining())
-                            image.planes[0].buffer.get(jpegBytes)
-
-                            val rotation = image.imageInfo.rotationDegrees
-
-                            val bitmapRaw = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-                                ?: run {
-                                    Log.e("CAPTURE", "Failed to decode JPEG bytes")
-                                    return@launch
-                                }
-
-                            val matrix = Matrix().apply {
-                                postRotate(rotation.toFloat())
-                            }
-
-                            val bitmap = Bitmap.createBitmap(
-                                bitmapRaw,
-                                0,
-                                0,
-                                bitmapRaw.width,
-                                bitmapRaw.height,
-                                matrix,
-                                true
-                            )
-
-                            Log.d("CAPTURE", "JPEG decoded → ${bitmap.width}x${bitmap.height}")
-                            saveBitmapToGallery(bitmap)
-
-                            lastSavedTime = System.currentTimeMillis()
-                            lastSavedScore = analysisBuffer.lastOrNull()?.score ?: lastSavedScore
-
-                            Log.d("CAPTURE", "Photo saved successfully | score=${lastSavedScore.format(2)}")
-
-                        } catch (e: Exception) {
-                            Log.e("CAPTURE", "Error saving photo", e)
-                        } finally {
-                            image.close()
-                            isCapturing = false
-                            Log.d("CAPTURE", "Capture finished, isCapturing=false")
-                        }
+                        processAndSaveImage(image)
                     }
                 }
 
                 override fun onError(exception: ImageCaptureException) {
-                    Log.e("CAPTURE", "ZSL Capture FAILED", exception)
-                    isCapturing = false
+                    Log.e(TAG, "Capture failed", exception)
+                    captureProcessor.notifyCaptureFinished()
                 }
+            },
+        )
+    }
+
+    private fun processAndSaveImage(image: ImageProxy) {
+        try {
+            val jpegBytes = ByteArray(image.planes[0].buffer.remaining())
+            image.planes[0].buffer.get(jpegBytes)
+
+            val rotation = image.imageInfo.rotationDegrees
+
+            val bitmapRaw =
+                BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                    ?: throw IllegalStateException("Failed to decode JPEG bytes")
+
+            val matrix = Matrix()
+            matrix.postRotate(rotation.toFloat())
+
+            // Mirror for front camera
+            if (_uiState.value.isFrontCamera) {
+                matrix.postScale(-1f, 1f)
             }
-            )
+
+            val bitmap =
+                Bitmap.createBitmap(
+                    bitmapRaw,
+                    0,
+                    0,
+                    bitmapRaw.width,
+                    bitmapRaw.height,
+                    matrix,
+                    true,
+                )
+
+            saveBitmapToGallery(bitmap)
+            captureProcessor.notifyCaptureFinished()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing image", e)
+            captureProcessor.notifyCaptureFinished()
+        } finally {
+            image.close()
         }
     }
 
-    private fun processFullRes(fullBitmap: Bitmap) {
-        Log.d("CAPTURE", "processFullRes | bitmap=${fullBitmap.width}x${fullBitmap.height}")
-        saveBitmapToGallery(fullBitmap)
-        lastSavedTime = System.currentTimeMillis()
-        lastSavedScore = analysisBuffer.lastOrNull()?.score ?: lastSavedScore
-        Log.d("CAPTURE", "Photo saved | new lastSavedScore=${lastSavedScore.format(2)}")
-    }
-
-    // ========================= HELPERS =========================
-    private fun calculateVelocity(
-        current: List<Landmark>,
-        previous: List<Landmark>?
-    ): Float {
-        if (previous == null || current.size != previous.size) {
-            return 1.0f                     // первый кадр = сильное движение
-        }
-
-        // Ключевые стабильные точки тела
-        val keyIndices = listOf(0, 11, 12, 23, 24, 25, 26)
-
-        // Нормализация по ширине плеч (самый надёжный способ)
-        val shoulderWidth = hypot(
-            current[12].x - current[11].x,
-            current[12].y - current[11].y
-        ).coerceAtLeast(0.08f)
-
-        var sum = 0f
-        var count = 0
-
-        for (i in keyIndices) {
-            if (i >= current.size) continue
-
-            val dx = current[i].x - previous[i].x
-            val dy = current[i].y - previous[i].y
-            sum += hypot(dx, dy) / shoulderWidth
-            count++
-        }
-
-        return if (count == 0) 1.0f else sum / count
-    }
-
-    private fun trimBuffer(now: Long) {
-        while (analysisBuffer.isNotEmpty() && now - analysisBuffer.first().timestamp > bufferWindowMs) {
-            analysisBuffer.removeFirst()
-        }
-    }
-
-    // ========================= UI =========================
-    fun toggleCapture() {
-        _uiState.value = _uiState.value.copy(isCaptureActive = !_uiState.value.isCaptureActive)
-    }
-
-    fun switchCamera() {
-        _uiState.value = _uiState.value.copy(isFrontCamera = !_uiState.value.isFrontCamera)
-    }
-
-    // ========================= SAVE =========================
-    private fun saveBitmapToGallery(bitmap: Bitmap) {
+    // ========================= STORAGE =========================
+    // ========================= STORAGE =========================
+    private fun loadLastPhotoFromGallery() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val filename = "AutoPose_${System.currentTimeMillis()}.jpg"
-                val contentValues = ContentValues().apply {
+                val projection = arrayOf(MediaStore.Images.Media._ID)
+                val selection = "${MediaStore.Images.Media.RELATIVE_PATH} = ?"
+                val selectionArgs = arrayOf("Pictures/$FOLDER_NAME/")
+                val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+                val cursor =
+                    appContext.contentResolver.query(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        projection,
+                        selection,
+                        selectionArgs,
+                        sortOrder,
+                    )
+
+                cursor?.use {
+                    if (it.moveToFirst()) {
+                        val id = it.getLong(it.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
+                        val imageUri =
+                            android.content.ContentUris.withAppendedId(
+                                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                                id,
+                            )
+                        val thumbnail = loadThumbnailSafely(imageUri, PREVIEW_SIZE)
+
+                        if (thumbnail != null) {
+                            _uiState.value = _uiState.value.copy(lastGalleryBitmap = thumbnail)
+                            Log.d(TAG, "Last photo loaded from gallery: ${thumbnail.width}x${thumbnail.height}")
+                        } else {
+                            Log.w(TAG, "Failed to load thumbnail: result is null")
+                        }
+                    } else {
+                        Log.d(TAG, "Gallery is empty or no photos in folder")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load last photo", e)
+            }
+        }
+    }
+
+    /**
+     * Safely loads a thumbnail from URI, handling different Android API levels.
+     * @param uri The image URI
+     * @param targetSize Target width/height in pixels
+     * @return Scaled bitmap or null if loading failed
+     */
+    private fun loadThumbnailSafely(
+        uri: android.net.Uri,
+        targetSize: Int,
+    ): Bitmap? {
+        return try {
+            when {
+                // Android 10+ (API 29+): Native thumbnail loading
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                    appContext.contentResolver.loadThumbnail(
+                        uri,
+                        android.util.Size(targetSize, targetSize),
+                        null,
+                    )
+                }
+                // Android 9 (API 28): ImageDecoder with size hint
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P -> {
+                    val source =
+                        android.graphics.ImageDecoder.createSource(
+                            appContext.contentResolver,
+                            uri,
+                        )
+                    android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                        decoder.setTargetSampleSize(
+                            calculateSampleSize(info.size.width, info.size.height, targetSize),
+                        )
+                    }
+                }
+                // Android 4.1-8 (API 16-27): BitmapFactory with manual downsampling
+                else -> {
+                    val options =
+                        BitmapFactory.Options().apply {
+                            inJustDecodeBounds = true
+                            appContext.contentResolver.openInputStream(uri)?.use {
+                                BitmapFactory.decodeStream(it, null, this)
+                            }
+                            inSampleSize = calculateSampleSize(outWidth, outHeight, targetSize)
+                            inJustDecodeBounds = false
+                            inPreferredConfig = Bitmap.Config.RGB_565
+                        }
+                    appContext.contentResolver.openInputStream(uri)?.use { inputStream ->
+                        val bitmap = BitmapFactory.decodeStream(inputStream, null, options)
+                        if (bitmap != null && (bitmap.width != targetSize || bitmap.height != targetSize)) {
+                            val scaled = bitmap.scale(targetSize, targetSize, false)
+                            if (scaled != bitmap) {
+                                bitmap.recycle()
+                            }
+                            scaled
+                        } else {
+                            bitmap
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error loading thumbnail from $uri", e)
+            null
+        }
+    }
+
+    /**
+     * Calculates the optimal inSampleSize for BitmapFactory.*
+     * @param originalWidth Original image width
+     * @param originalHeight Original image height
+     * @param targetSize Desired max width/height
+     * @return Sample size (1, 2, 4, 8, ...)
+     */
+    private fun calculateSampleSize(
+        originalWidth: Int,
+        originalHeight: Int,
+        targetSize: Int,
+    ): Int {
+        var sampleSize = 1
+
+        if (originalHeight > targetSize || originalWidth > targetSize) {
+            val halfHeight = originalHeight / 2
+            val halfWidth = originalWidth / 2
+
+            while (halfHeight / sampleSize >= targetSize &&
+                halfWidth / sampleSize >= targetSize
+            ) {
+                sampleSize *= 2
+            }
+        }
+
+        return sampleSize
+    }
+
+    private fun saveBitmapToGallery(bitmap: Bitmap) {
+        try {
+            val filename = "AutoPose_${System.currentTimeMillis()}.jpg"
+            val contentValues =
+                ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
                     put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AutoPose")
+                        put(
+                            MediaStore.Images.Media.RELATIVE_PATH,
+                            Environment.DIRECTORY_PICTURES + "/$FOLDER_NAME",
+                        )
                     }
                 }
-                val uri = appContext.contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues
-                ) ?: return@launch
 
-                appContext.contentResolver.openOutputStream(uri)?.use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            val uri =
+                appContext.contentResolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    contentValues,
+                ) ?: throw IllegalStateException("Failed to create MediaStore entry")
+
+            appContext.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY_SAVE, outputStream)
+                outputStream.flush()
             }
+
+            val previewBitmap = bitmap.scale(PREVIEW_SIZE, PREVIEW_SIZE, false)
+            _uiState.value = _uiState.value.copy(lastGalleryBitmap = previewBitmap)
+
+            Log.d(TAG, "Photo saved successfully: $filename")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save bitmap to gallery", e)
         }
     }
 
-    // ========================= REQUIRED FUNCTIONS =========================
-    private fun getPersonRoi(bitmap: Bitmap, resultBundle: PoseLandmarkerHelper.ResultBundle?): Rect? {
-        val results = resultBundle?.results ?: return null
-        val firstResult = results.firstOrNull() ?: return null
-        val landmarksList = firstResult.landmarks() ?: return null
+    // ========================= USER ACTIONS =========================
+    fun toggleCapture() {
+        val newState = !_uiState.value.isCaptureActive
+        _uiState.value = _uiState.value.copy(isCaptureActive = newState)
 
-        var minX = Float.MAX_VALUE
-        var minY = Float.MAX_VALUE
-        var maxX = Float.MIN_VALUE
-        var maxY = Float.MIN_VALUE
-
-        landmarksList.forEach { landmarkList ->
-            landmarkList.forEach { landmark ->
-                val x = landmark.x() * bitmap.width
-                val y = landmark.y() * bitmap.height
-                minX = minOf(minX, x)
-                minY = minOf(minY, y)
-                maxX = maxOf(maxX, x)
-                maxY = maxOf(maxY, y)
-            }
+        if (!newState) {
+            Log.d(TAG, "Capture stopped. Resetting processor.")
+            captureProcessor.reset()
+        } else {
+            Log.d(TAG, "Capture started")
         }
-
-        if (minX == Float.MAX_VALUE || minY == Float.MAX_VALUE) return null
-
-        val width = maxX - minX
-        val height = maxY - minY
-        val padX = width * 0.25f
-        val padY = height * 0.35f
-
-        val left = (minX - padX).toInt().coerceAtLeast(0)
-        val top = (minY - padY).toInt().coerceAtLeast(0)
-        val right = (maxX + padX).toInt().coerceAtMost(bitmap.width)
-        val bottom = (maxY + padY).toInt().coerceAtMost(bitmap.height)
-
-        return Rect(left, top, right, bottom)
     }
 
-    private fun isValidPose(resultBundle: PoseLandmarkerHelper.ResultBundle): Boolean {
-        val result = resultBundle.results.firstOrNull() ?: return false
-        val landmarks = result.landmarks()?.firstOrNull() ?: return false
+    fun switchCamera() {
+        val newFrontState = !_uiState.value.isFrontCamera
+        Log.d(TAG, "Switching camera. Front: $newFrontState")
 
-        if (landmarks.size < 16) return false
-
-        val reliablePoints = landmarks.count {
-            it.visibility().orElse(0f) > 0.6f &&
-                it.presence().orElse(0f) > 0.5f
-        }
-
-        val xs = landmarks.map { it.x() }
-        val ys = landmarks.map { it.y() }
-
-        val width = (xs.max() - xs.min())
-        val height = (ys.max() - ys.min())
-        val area = width * height
-
-        val spread = width + height
-
-        val isBigEnough = area > 0.06f
-        val isNotCollapsed = spread > 0.6f
-
-        return reliablePoints >= 14 && isBigEnough && isNotCollapsed
+        _uiState.value = _uiState.value.copy(isFrontCamera = newFrontState)
+        captureProcessor.reset()
+        createImageCapture()
     }
-
 
     // ========================= CLEANUP =========================
     override fun onCleared() {
         super.onCleared()
+        Log.d(TAG, "ViewModel cleared. Shutting down executor and ML helpers.")
         cameraExecutor.shutdown()
         poseHelper.clearPoseLandmarker()
         aestheticPredictor.close()
