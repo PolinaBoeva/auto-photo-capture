@@ -9,6 +9,8 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Size
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageAnalysis
@@ -16,6 +18,9 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.runtime.getValue
@@ -44,7 +49,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val PREVIEW_SIZE = 300
         private const val JPEG_QUALITY_HIGH = 100
         private const val JPEG_QUALITY_SAVE = 95
+        private val ANALYSIS_RESOLUTION = Size(1280, 960)
     }
+
+    private var currentAnalysisWidth: Int = 0
+    private var currentAnalysisHeight: Int = 0
 
     // ========================= UI STATE =========================
     private val _uiState = MutableStateFlow(CameraUiState())
@@ -72,6 +81,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private lateinit var imageAnalysis: ImageAnalysis
     private lateinit var imageCapture: ImageCapture
 
+    // Camera reference for focus control
+    private var currentCamera: Camera? = null
+
+    // Focus components
+    private var meteringPointFactory: SurfaceOrientedMeteringPointFactory? = null
+    private var focusController: PersonFocusController? = null
+
     // ========================= INITIALIZATION =========================
     init {
         Log.d(TAG, "Initializing ViewModel")
@@ -86,10 +102,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 runningMode = RunningMode.LIVE_STREAM,
                 poseLandmarkerHelperListener =
                     object : PoseLandmarkerHelper.LandmarkerListener {
-                        override fun onError(
-                            error: String,
-                            errorCode: Int,
-                        ) {
+                        override fun onError(error: String, errorCode: Int) {
                             Log.e(TAG, "Pose Landmarker error [$errorCode]: $error")
                         }
 
@@ -103,6 +116,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             AutoCaptureProcessor(
                 aestheticPredictor = aestheticPredictor,
                 onCaptureTriggered = { triggerCapture() },
+                focusController = null, // Will be set via setFocusController() after bind
             )
     }
 
@@ -134,7 +148,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             try {
                 provider.unbindAll()
-                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageCapture, imageAnalysis)
+                currentCamera = provider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    preview,
+                    imageCapture,
+                    imageAnalysis
+                )
+
+                // Initialize focus components
+                initializeFocusComponents()
+
                 Log.d(TAG, "Camera bound successfully. Front: ${_uiState.value.isFrontCamera}")
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
@@ -142,14 +166,48 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }, ContextCompat.getMainExecutor(previewView.context))
     }
 
+    /**
+     * Initializes focus control components after camera is bound.
+     */
+    private fun initializeFocusComponents() {
+        val camera = currentCamera ?: return
+
+        meteringPointFactory = SurfaceOrientedMeteringPointFactory(
+            ANALYSIS_RESOLUTION.width.toFloat(),
+            ANALYSIS_RESOLUTION.height.toFloat()
+        )
+
+        focusController = PersonFocusController(
+            cameraControl = camera.cameraControl,
+            meteringPointFactory = meteringPointFactory!!
+        )
+
+        captureProcessor.setFocusController(focusController)
+
+        Log.d(TAG, "Focus components initialized")
+    }
+
     private fun createImageAnalysis(): ImageAnalysis {
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    ANALYSIS_RESOLUTION,
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                )
+            )
+            .build()
+
         return ImageAnalysis.Builder()
+            .setResolutionSelector(resolutionSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
             .also { analysis ->
                 imageAnalysis = analysis
                 analysis.setAnalyzer(cameraExecutor) { proxy ->
+                    currentAnalysisWidth = proxy.width
+                    currentAnalysisHeight = proxy.height
+
                     poseHelper.detectLiveStream(proxy, _uiState.value.isFrontCamera)
                 }
             }
@@ -186,7 +244,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        captureProcessor.processFrame(bitmap, resultBundle)
+        captureProcessor.processFrame(
+            bitmap = bitmap,
+            resultBundle = resultBundle,
+            imageAnalysisWidth = ANALYSIS_RESOLUTION.width,
+            imageAnalysisHeight = ANALYSIS_RESOLUTION.height
+        )
     }
 
     private fun triggerCapture() {
@@ -195,14 +258,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        val delayMs = AutoCaptureProcessor.Config().targetDelayMs
-        Log.d(TAG, "=== CAPTURE TRIGGERED === (Delay: ${delayMs}ms)")
-
+        // val delayMs = AutoCaptureProcessor.Config().targetDelayMs
+        // Log.d(TAG, "=== CAPTURE TRIGGERED === (Delay: ${delayMs}ms)")
+        Log.d(TAG, "=== CAPTURE TRIGGERED ===")
         captureProcessor.notifyCaptureStarted()
         _captureTrigger.value++
 
         viewModelScope.launch {
-            delay(delayMs)
+            // delay(delayMs)
             takePicture()
         }
     }
@@ -272,7 +335,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     // ========================= STORAGE =========================
-    // ========================= STORAGE =========================
     private fun loadLastPhotoFromGallery() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -316,27 +378,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /**
-     * Safely loads a thumbnail from URI, handling different Android API levels.
-     * @param uri The image URI
-     * @param targetSize Target width/height in pixels
-     * @return Scaled bitmap or null if loading failed
-     */
-    private fun loadThumbnailSafely(
-        uri: android.net.Uri,
-        targetSize: Int,
-    ): Bitmap? {
+    private fun loadThumbnailSafely(uri: android.net.Uri, targetSize: Int): Bitmap? {
         return try {
             when {
-                // Android 10+ (API 29+): Native thumbnail loading
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
                     appContext.contentResolver.loadThumbnail(
                         uri,
-                        android.util.Size(targetSize, targetSize),
+                        Size(targetSize, targetSize),
                         null,
                     )
                 }
-                // Android 9 (API 28): ImageDecoder with size hint
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.P -> {
                     val source =
                         android.graphics.ImageDecoder.createSource(
@@ -349,7 +400,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         )
                     }
                 }
-                // Android 4.1-8 (API 16-27): BitmapFactory with manual downsampling
                 else -> {
                     val options =
                         BitmapFactory.Options().apply {
@@ -365,9 +415,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                         val bitmap = BitmapFactory.decodeStream(inputStream, null, options)
                         if (bitmap != null && (bitmap.width != targetSize || bitmap.height != targetSize)) {
                             val scaled = bitmap.scale(targetSize, targetSize, false)
-                            if (scaled != bitmap) {
-                                bitmap.recycle()
-                            }
+                            if (scaled != bitmap) bitmap.recycle()
                             scaled
                         } else {
                             bitmap
@@ -381,31 +429,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    /**
-     * Calculates the optimal inSampleSize for BitmapFactory.*
-     * @param originalWidth Original image width
-     * @param originalHeight Original image height
-     * @param targetSize Desired max width/height
-     * @return Sample size (1, 2, 4, 8, ...)
-     */
-    private fun calculateSampleSize(
-        originalWidth: Int,
-        originalHeight: Int,
-        targetSize: Int,
-    ): Int {
+    private fun calculateSampleSize(originalWidth: Int, originalHeight: Int, targetSize: Int): Int {
         var sampleSize = 1
-
         if (originalHeight > targetSize || originalWidth > targetSize) {
             val halfHeight = originalHeight / 2
             val halfWidth = originalWidth / 2
-
-            while (halfHeight / sampleSize >= targetSize &&
-                halfWidth / sampleSize >= targetSize
-            ) {
+            while (halfHeight / sampleSize >= targetSize && halfWidth / sampleSize >= targetSize) {
                 sampleSize *= 2
             }
         }
-
         return sampleSize
     }
 
@@ -473,5 +505,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraExecutor.shutdown()
         poseHelper.clearPoseLandmarker()
         aestheticPredictor.close()
+        currentCamera = null
+        focusController?.reset()
     }
 }

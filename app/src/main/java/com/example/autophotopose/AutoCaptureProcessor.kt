@@ -1,14 +1,10 @@
 package com.example.autophotopose
 
 import android.graphics.Bitmap
+import android.graphics.PointF
 import android.graphics.Rect
 import android.util.Log
 import com.example.autophotopose.ui.AestheticPredictor
-import org.opencv.core.Core
-import org.opencv.core.CvType
-import org.opencv.core.Mat
-import org.opencv.core.MatOfDouble
-import org.opencv.imgproc.Imgproc
 import kotlin.math.hypot
 
 // ========================= DATA CLASS =========================
@@ -21,6 +17,7 @@ data class Landmark(val x: Float, val y: Float)
 class AutoCaptureProcessor(
     private val aestheticPredictor: AestheticPredictor,
     private val onCaptureTriggered: () -> Unit,
+    private var focusController: PersonFocusController? = null,
     private val config: Config = Config(),
 ) {
     companion object {
@@ -29,26 +26,29 @@ class AutoCaptureProcessor(
 
     data class Config(
         val minStableMs: Long = 300L,
-        val poseChangeThreshold: Float = 0.6f,
-        val stableVelocityThreshold: Float = 0.45f,
+        val poseChangeThreshold: Float = 0.75f,
+        val stableVelocityThreshold: Float = 0.28f,
         val peakRatio: Float = 0.92f,
         val targetDelayMs: Long = 80L,
         val bufferWindowMs: Long = 1200L,
-        val minBufferFrames: Int = 6,
+        val minBufferFrames: Int = 8,
         val recentFramesCount: Int = 12,
         val minValidFrames: Int = 3,
-        val stabilityRatioThreshold: Float = 0.55f,
+        val stabilityRatioThreshold: Float = 0.8f,
         val scoreImprovementFactor: Float = 1.05f,
         val highQualityThreshold: Float = 7.5f,
         val cooldownNormal: Long = 3200L,
         val cooldownImproved: Long = 1800L,
-    )
+        val continuousStableMs: Long = 250L,
+        val continuousStableVelocityThreshold: Float = 0.22f,
+        val finalFrameVelocityThreshold: Float = 0.08f,
+        val minConsecutiveStableFrames: Int = 4,
+        )
 
     private data class AnalysisFrame(
         val timestamp: Long,
         val score: Float,
         val velocity: Float,
-        val isBlur: Boolean,
         val landmarks: List<Landmark>,
     )
 
@@ -58,6 +58,12 @@ class AutoCaptureProcessor(
     private var lastSavedScore = 5f
     private var lastTriggerTime = 0L
     private var isCapturing = false
+    private var stabilityWindowStartMs: Long = 0L
+    private var consecutiveStableFrames: Int = 0
+    private var cachedRoi: Rect? = null
+    private var roiNormalizedCenter = PointF(0.5f, 0.5f)
+
+    private var shotsInSession: Int = 0
 
     // ================= PUBLIC API =================
     val isReady: Boolean get() = !isCapturing
@@ -69,7 +75,8 @@ class AutoCaptureProcessor(
     fun processFrame(
         bitmap: Bitmap,
         resultBundle: PoseLandmarkerHelper.ResultBundle,
-        isBlurDetectorEnabled: Boolean = true,
+        imageAnalysisWidth: Int = 0,
+        imageAnalysisHeight: Int = 0,
     ): Boolean {
         if (isCapturing) return false
 
@@ -87,15 +94,32 @@ class AutoCaptureProcessor(
 
         // 2. Pose Change Detection
         val velocity = calculateVelocity(landmarks, lastLandmarks)
-        if (velocity > config.poseChangeThreshold) {
+        val isPoseChanged = velocity > config.poseChangeThreshold
+
+        if (isPoseChanged) {
             analysisBuffer.clear()
             lastLandmarks = landmarks
+            shotsInSession = 0
             Log.d(TAG, "New pose detected → buffer cleared")
+            val newRoi = getPersonRoi(bitmap, resultBundle)
+            if (newRoi != null) {
+                cachedRoi = newRoi
+                roiNormalizedCenter.x = newRoi.centerX().toFloat() / bitmap.width
+                roiNormalizedCenter.y = newRoi.centerY().toFloat() / bitmap.height
+
+                focusController?.onRoiCenterChanged(
+                    normCenterX = roiNormalizedCenter.x,
+                    normCenterY = roiNormalizedCenter.y,
+                    imageWidth = imageAnalysisWidth,
+                    imageHeight = imageAnalysisHeight
+                )
+            }
+
             return false
         }
 
         // 3. ROI + Aesthetic Score
-        val roiRect = getPersonRoi(bitmap, resultBundle) ?: return false
+        val roiRect = cachedRoi ?: getPersonRoi(bitmap, resultBundle) ?: return false
 
         val roiBitmap =
             try {
@@ -112,22 +136,23 @@ class AutoCaptureProcessor(
             }
 
         val score = aestheticPredictor.predictAesthetic(roiBitmap)
-        val blur = if (isBlurDetectorEnabled) isBlurred(roiBitmap) else false
 
         // Recycle immediately to save memory
         roiBitmap.recycle()
 
         // 4. Add to Buffer
         val now = System.currentTimeMillis()
-        analysisBuffer.addLast(AnalysisFrame(now, score, velocity, blur, landmarks))
+        analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
         trimBuffer(now)
         lastLandmarks = landmarks
 
         Log.d(
             TAG,
             "Frame buffered | score=${score.format(2)}, vel=${velocity.format(3)}, " +
-                "blur=$blur, buffer=${analysisBuffer.size}",
+                "buffer=${analysisBuffer.size}",
         )
+
+        updateStabilityWindow(velocity, now)
 
         // 5. Check Trigger
         if (shouldTrigger()) {
@@ -138,6 +163,35 @@ class AutoCaptureProcessor(
         return true
     }
 
+    /**
+     * Updates the continuous stability window state based on current velocity.
+     */
+    private fun updateStabilityWindow(velocity: Float, now: Long) {
+        val stableThreshold = config.continuousStableVelocityThreshold
+        val resetThreshold = stableThreshold * 1.6f
+
+        val isStable = velocity < stableThreshold
+        val isUnstable = velocity > resetThreshold
+
+        if (isUnstable) {
+                stabilityWindowStartMs = 0L
+                consecutiveStableFrames = 0
+                shotsInSession = 0
+            Log.d(TAG, "Stability window HARD RESET (vel=${velocity.format(3)} > ${resetThreshold.format(2)})")
+        } else if (isStable) {
+            if (consecutiveStableFrames == 0) {
+                stabilityWindowStartMs = now
+                Log.d(TAG, "Stability window STARTED at $now (vel=${velocity.format(3)})")
+            }
+            consecutiveStableFrames++
+        }
+
+        if (consecutiveStableFrames > 0) {
+            val duration = now - stabilityWindowStartMs
+            Log.d(TAG, "Stability window: $consecutiveStableFrames frames, ${duration}ms continuous")
+        }
+    }
+
     fun notifyCaptureStarted() {
         isCapturing = true
         lastTriggerTime = System.currentTimeMillis()
@@ -146,6 +200,12 @@ class AutoCaptureProcessor(
 
     fun notifyCaptureFinished(score: Float? = null) {
         isCapturing = false
+
+        // Reset stability window after capture
+        stabilityWindowStartMs = 0L
+        consecutiveStableFrames = 0
+        Log.d(TAG, "Stability window reset after capture")
+
         score?.let {
             lastSavedScore = it
             Log.d(TAG, "Capture finished. Last saved score: ${it.format(2)}")
@@ -158,6 +218,12 @@ class AutoCaptureProcessor(
         analysisBuffer.clear()
         lastLandmarks = null
         isCapturing = false
+        stabilityWindowStartMs = 0L
+        consecutiveStableFrames = 0
+        shotsInSession = 0
+        cachedRoi = null
+        roiNormalizedCenter.set(0.5f, 0.5f)
+        focusController?.reset()
         Log.d(TAG, "Processor reset.")
     }
 
@@ -174,98 +240,149 @@ class AutoCaptureProcessor(
 
         val currentFrame = recent.last()
 
-        // 1. Stability Check
-        val stableCount = recent.count { it.velocity < config.stableVelocityThreshold }
-        val oldestTimestamp = recent.firstOrNull()?.timestamp ?: now
-        val windowDuration = now - oldestTimestamp
-        val stableRatio = stableCount.toFloat() / recent.size
+        // 1. CONTINUOUS STABILITY WINDOW CHECK
+        val stabilityDuration = if (stabilityWindowStartMs > 0L) {
+            now - stabilityWindowStartMs
+        } else 0L
 
-        val isStableEnough =
-            (stableRatio >= config.stabilityRatioThreshold) &&
-                (windowDuration >= config.minStableMs)
+        val isContinuouslyStable =
+            stabilityDuration >= config.continuousStableMs &&
+                consecutiveStableFrames >= config.minConsecutiveStableFrames
 
-        if (!isStableEnough) {
-            Log.d(TAG, "Trigger REJECTED: unstable (ratio=$stableRatio, duration=${windowDuration}ms)")
+        if (!isContinuouslyStable) {
+            Log.d(
+                TAG,
+                "Trigger REJECTED: continuous stability not met " +
+                    "(duration=${stabilityDuration}ms < ${config.continuousStableMs}ms, " +
+                    "frames=$consecutiveStableFrames < ${config.minConsecutiveStableFrames})"
+            )
             return false
         }
 
-        // 2. Current Frame Quality
-        if (currentFrame.velocity > config.stableVelocityThreshold || currentFrame.isBlur) {
-            Log.d(TAG, "Trigger REJECTED: current frame poor quality")
+        // STRICT FINAL FRAME CHECK
+        if (currentFrame.velocity > config.finalFrameVelocityThreshold) {
+            Log.d(TAG, "Trigger REJECTED: final frame velocity too high (${currentFrame.velocity.format(3)})")
             return false
         }
 
-        // 3. Valid Frames Count
-        val validFrames = recent.filter { !it.isBlur && it.velocity < config.stableVelocityThreshold }
+        // 3. VALID FRAMES COUNT
+        val validFrames = recent.filter { it.velocity < config.stableVelocityThreshold }
         if (validFrames.size < config.minValidFrames) {
             Log.d(TAG, "Trigger REJECTED: not enough valid frames (${validFrames.size})")
             return false
         }
 
-        // 4. Peak Detection
+        // 4. PEAK DETECTION
         val maxScore = validFrames.maxOf { it.score }
         val prevScore = recent.getOrNull(recent.lastIndex - 1)?.score ?: 0f
+
         val isPeak =
             currentFrame.score >= maxScore * config.peakRatio &&
                 currentFrame.score >= prevScore - 0.04f
 
-        if (!isPeak) {
-            Log.d(TAG, "Trigger REJECTED: not a peak (curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)})")
+        val allowNearPeak = currentFrame.score >= maxScore * 0.88f
+
+        val minAcceptableScore = kotlin.math.max(3.5f, lastSavedScore * 0.97f)
+        val allowRelative = currentFrame.score >= minAcceptableScore
+
+        if (!isPeak && !allowNearPeak && !allowRelative) {
+            Log.d(
+                TAG,
+                "Trigger REJECTED: not peak/near-peak/relative " +
+                    "(curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)}, min=$minAcceptableScore)"
+            )
             return false
         }
 
-        // 5. Cooldown Check
-        val isBetterThanLast = currentFrame.score > lastSavedScore * config.scoreImprovementFactor
-        val isHighQuality = currentFrame.score > config.highQualityThreshold
-        val cooldown =
-            if (isBetterThanLast || isHighQuality) {
-                config.cooldownImproved
-            } else {
-                config.cooldownNormal
-            }
+        // 5. VELOCITY-ADAPTIVE COOLDOWN
         val timeSinceLast = now - lastTriggerTime
 
-        if (timeSinceLast < cooldown) {
-            Log.d(TAG, "Trigger REJECTED: cooldown active (${timeSinceLast}ms < ${cooldown}ms)")
+        // Base cooldown depends on score quality
+        val isBetterThanLast = currentFrame.score > lastSavedScore * config.scoreImprovementFactor
+        val isHighQuality = currentFrame.score > config.highQualityThreshold
+        val baseCooldown = if (isBetterThanLast || isHighQuality) config.cooldownImproved else config.cooldownNormal
+
+        // Adaptive cooldown: shorter when pose is more stable (direct velocity mapping)
+        val adaptiveCooldown = when {
+            currentFrame.velocity < 0.04f -> 800L   // Rock steady: fast burst
+            currentFrame.velocity < 0.08f -> 1200L   // Very stable: moderate pace
+            currentFrame.velocity < 0.15f -> 2000L   // Slight movement: slower
+            else -> baseCooldown                      // Moving: normal cooldown
+        }.coerceAtMost(baseCooldown) // Never exceed base cooldown
+
+        // 6. SESSION SHOT LIMIT
+        if (timeSinceLast > 5000L) {
+            shotsInSession = 0
+        }
+
+        if (timeSinceLast < adaptiveCooldown || shotsInSession >= 4) {
+            Log.d(
+                TAG,
+                "Trigger REJECTED: cooldown (${timeSinceLast}ms < ${adaptiveCooldown}ms) " +
+                    "or session limit ($shotsInSession/4)"
+            )
             return false
         }
+
+        // Update session counter
+        shotsInSession++
 
         Log.d(
             TAG,
             "Trigger ACCEPTED | score=${currentFrame.score.format(2)}, " +
-                "vel=${currentFrame.velocity.format(3)}, stable=$stableCount/${recent.size}",
+                "vel=${currentFrame.velocity.format(3)}, " +
+                "stable_window=${stabilityDuration}ms/$consecutiveStableFrames frames, " +
+                "cooldown=${adaptiveCooldown}ms, session=$shotsInSession/4"
         )
         return true
     }
 
     // ================= HELPERS =================
+    /**
+     * Sets or updates the focus controller after processor initialization.
+     */
+    fun setFocusController(controller: PersonFocusController?) {
+        this.focusController = controller
+        Log.d(TAG, "Focus controller ${if (controller != null) "attached" else "detached"}")
+    }
+
     private fun calculateVelocity(
         current: List<Landmark>,
-        previous: List<Landmark>?,
+        previous: List<Landmark>?
     ): Float {
         if (previous == null || current.size != previous.size) return 1.0f
 
-        // Key points for movement: Nose, Shoulders, Hips, Knees
-        val keyIndices = listOf(0, 11, 12, 23, 24, 25, 26)
+        // Normalize displacement by shoulder width for scale invariance
+        val shoulderWidth = hypot(
+            (current[12].x - current[11].x).toDouble(),
+            (current[12].y - current[11].y).toDouble()
+        ).toFloat().coerceAtLeast(0.08f)
 
-        // Normalize by shoulder width to make velocity scale-invariant
-        val shoulderWidth =
-            hypot(
-                (current[12].x - current[11].x).toDouble(),
-                (current[12].y - current[11].y).toDouble(),
-            ).toFloat().coerceAtLeast(0.08f)
-
-        var sum = 0f
-        var count = 0
-        for (i in keyIndices) {
-            if (i >= current.size) continue
+        // Helper: compute normalized Euclidean distance for a landmark index
+        fun dist(i: Int): Float {
             val dx = (current[i].x - previous[i].x).toDouble()
             val dy = (current[i].y - previous[i].y).toDouble()
-            // hypot returns Double, so we cast to Float
-            sum += hypot(dx, dy).toFloat() / shoulderWidth
-            count++
+            return hypot(dx, dy).toFloat() / shoulderWidth
         }
-        return if (count == 0) 1.0f else sum / count
+
+        val core = listOf(0, 11, 12, 23, 24)           // Nose, shoulders, hips (high stability weight)
+        val secondary = listOf(13, 14, 25, 26)         // Elbows, knees (moderate movement tolerance)
+        val extremities = listOf(15, 16, 27, 28)       // Wrists, ankles (ignore tremor, wind, footwear noise)
+
+        // Average velocity per group
+        val coreVel = core.map { dist(it) }.average().toFloat()
+        val secondaryVel = secondary.map { dist(it) }.average().toFloat()
+        val extremitiesVel = extremities.map { dist(it) }.average().toFloat()
+
+        // Weighted average: core dominates, extremities have minimal impact
+        val avg = coreVel * 0.6f + secondaryVel * 0.3f + extremitiesVel * 0.1f
+
+        // Safety fallback: if any core point moves significantly,
+        // ensure overall velocity reflects it (prevents "still hands, moving torso" false positives)
+        val maxCore = core.maxOf { dist(it) }
+
+        // Return the higher of weighted avg or core-max scaled, to avoid masking body motion
+        return maxOf(avg, maxCore * 0.9f)
     }
 
     private fun getPersonRoi(
@@ -322,52 +439,6 @@ class AutoCaptureProcessor(
         return reliablePoints >= 14 && area > 0.06f && spread > 0.6f
     }
 
-    /**
-     * Simple blur detection using Laplacian variance via OpenCV.
-     * Returns true if image is blurred.
-     */
-    private fun isBlurred(
-        bitmap: Bitmap,
-        threshold: Double = 100.0,
-    ): Boolean {
-        val mat = Mat()
-        val grayMat = Mat()
-        val laplacianMat = Mat()
-
-        val mean = MatOfDouble()
-        val stddev = MatOfDouble()
-
-        try {
-            // Convert Bitmap to Mat
-            org.opencv.android.Utils.bitmapToMat(bitmap, mat)
-
-            // Convert to grayscale
-            Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_RGBA2GRAY)
-
-            // Apply Laplacian operator
-            Imgproc.Laplacian(grayMat, laplacianMat, CvType.CV_64F)
-
-            // Calculate mean and standard deviation
-            Core.meanStdDev(laplacianMat, mean, stddev)
-
-            // Get variance (stddev^2) - MatOfDouble stores values in array via get()
-            val stddevValue = stddev.get(0, 0)[0]
-            val variance = stddevValue * stddevValue
-
-            // If variance is below threshold, image is blurry
-            return variance < threshold
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in blur detection", e)
-            return false // Assume not blurred on error to avoid blocking capture
-        } finally {
-            // Release OpenCV resources
-            mat.release()
-            grayMat.release()
-            laplacianMat.release()
-            mean.release()
-            stddev.release()
-        }
-    }
 
     private fun trimBuffer(now: Long) {
         while (analysisBuffer.isNotEmpty() &&
