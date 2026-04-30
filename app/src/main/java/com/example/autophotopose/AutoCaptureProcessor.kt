@@ -40,10 +40,14 @@ class AutoCaptureProcessor(
         val cooldownNormal: Long = 3200L,
         val cooldownImproved: Long = 1800L,
         val continuousStableMs: Long = 250L,
-        val continuousStableVelocityThreshold: Float = 0.22f,
-        val finalFrameVelocityThreshold: Float = 0.08f,
+        val continuousStableVelocityThreshold: Float = 0.10f,
+        val finalFrameVelocityThreshold: Float = 0.10f,
         val minConsecutiveStableFrames: Int = 4,
-        )
+        val freezeWindowFrames: Int = 4,
+        val freezeAvgThreshold: Float = 0.035f,
+        val freezeMaxThreshold: Float = 0.065f,
+        val maxAllowedSpikes: Int = 1,
+    )
 
     private data class AnalysisFrame(
         val timestamp: Long,
@@ -176,9 +180,9 @@ class AutoCaptureProcessor(
         val isUnstable = velocity > resetThreshold
 
         if (isUnstable) {
-                stabilityWindowStartMs = 0L
-                consecutiveStableFrames = 0
-                shotsInSession = 0
+            stabilityWindowStartMs = 0L
+            consecutiveStableFrames = 0
+            shotsInSession = 0
             Log.d(TAG, "Stability window HARD RESET (vel=${velocity.format(3)} > ${resetThreshold.format(2)})")
         } else if (isStable) {
             if (consecutiveStableFrames == 0) {
@@ -267,6 +271,20 @@ class AutoCaptureProcessor(
                     "frames=$consecutiveStableFrames < $requiredStableFrames)"
             )
             return false
+        }
+
+        val freezeFrames = analysisBuffer.takeLast(config.freezeWindowFrames)
+        if (freezeFrames.size >= config.freezeWindowFrames) {
+            val avgVel = freezeFrames.map { it.velocity }.average().toFloat()
+            val maxVel = freezeFrames.maxOf { it.velocity }
+            val spikes = freezeFrames.count { it.velocity > config.freezeAvgThreshold }
+
+            if (avgVel > config.freezeAvgThreshold ||
+                maxVel > config.freezeMaxThreshold ||
+                spikes > config.maxAllowedSpikes) {
+                Log.d(TAG, "Freeze window REJECTED | avg=${avgVel.format(3)}, max=${maxVel.format(3)}, spikes=$spikes")
+                return false
+            }
         }
 
         // STRICT FINAL FRAME CHECK
