@@ -62,9 +62,10 @@ class AutoCaptureProcessor(
     private var consecutiveStableFrames: Int = 0
     private var cachedRoi: Rect? = null
     private var roiNormalizedCenter = PointF(0.5f, 0.5f)
-
     private var shotsInSession: Int = 0
-
+    // FPS estimation for adaptive frame-based thresholds
+    private var avgFrameIntervalMs: Float = 33f
+    private var lastFrameTimestamp: Long = 0L
     // ================= PUBLIC API =================
     val isReady: Boolean get() = !isCapturing
 
@@ -143,6 +144,7 @@ class AutoCaptureProcessor(
         // 4. Add to Buffer
         val now = System.currentTimeMillis()
         analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
+        updateFrameIntervalEstimate(now)
         trimBuffer(now)
         lastLandmarks = landmarks
 
@@ -224,6 +226,8 @@ class AutoCaptureProcessor(
         cachedRoi = null
         roiNormalizedCenter.set(0.5f, 0.5f)
         focusController?.reset()
+        avgFrameIntervalMs = 100f
+        lastFrameTimestamp = 0L
         Log.d(TAG, "Processor reset.")
     }
 
@@ -240,21 +244,27 @@ class AutoCaptureProcessor(
 
         val currentFrame = recent.last()
 
-        // 1. CONTINUOUS STABILITY WINDOW CHECK
+        // === 1. CONTINUOUS STABILITY WINDOW CHECK ===
         val stabilityDuration = if (stabilityWindowStartMs > 0L) {
             now - stabilityWindowStartMs
         } else 0L
 
+        // Calculate required frames based on current FPS
+        val requiredStableFrames =
+            ((config.continuousStableMs / avgFrameIntervalMs.coerceAtLeast(30f)) + 0.5f)
+                .toInt()
+                .coerceIn(3, 12)
+
         val isContinuouslyStable =
             stabilityDuration >= config.continuousStableMs &&
-                consecutiveStableFrames >= config.minConsecutiveStableFrames
+                consecutiveStableFrames >= requiredStableFrames
 
         if (!isContinuouslyStable) {
             Log.d(
                 TAG,
                 "Trigger REJECTED: continuous stability not met " +
                     "(duration=${stabilityDuration}ms < ${config.continuousStableMs}ms, " +
-                    "frames=$consecutiveStableFrames < ${config.minConsecutiveStableFrames})"
+                    "frames=$consecutiveStableFrames < $requiredStableFrames)"
             )
             return false
         }
@@ -439,6 +449,20 @@ class AutoCaptureProcessor(
         return reliablePoints >= 14 && area > 0.06f && spread > 0.6f
     }
 
+    /**
+     * Updates the estimated frame interval using exponential moving average.
+     * Filters out anomalies (accepts 5-60 FPS range: 16ms - 200ms).
+     */
+    private fun updateFrameIntervalEstimate(now: Long) {
+        if (lastFrameTimestamp > 0L) {
+            val interval = now - lastFrameTimestamp
+            if (interval in 16..200) {
+                // EMA: 80% previous value + 20% new measurement for smooth convergence
+                avgFrameIntervalMs = avgFrameIntervalMs * 0.8f + interval * 0.2f
+            }
+        }
+        lastFrameTimestamp = now
+    }
 
     private fun trimBuffer(now: Long) {
         while (analysisBuffer.isNotEmpty() &&
