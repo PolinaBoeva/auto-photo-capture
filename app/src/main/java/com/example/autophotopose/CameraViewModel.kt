@@ -31,6 +31,7 @@ import androidx.core.graphics.scale
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.example.autophotopose.metrics.PerformanceMetricsCollector
 import com.example.autophotopose.ui.AestheticPredictor
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -72,6 +73,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private lateinit var poseHelper: PoseLandmarkerHelper
     private lateinit var captureProcessor: AutoCaptureProcessor
 
+    // ========================= METRICS =========================
+    private var metricsCollector: PerformanceMetricsCollector? = null
+
     // ========================= CAMERA X =========================
     private val cameraExecutor: ExecutorService =
         Executors.newSingleThreadExecutor {
@@ -112,12 +116,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     },
             )
 
+        metricsCollector = PerformanceMetricsCollector(getApplication())
+        Log.d("MetricsDebug", "MetricsCollector created: ${metricsCollector != null}")
+        Log.d("MetricsDebug", "File path: ${metricsCollector?.getFilePath()}")
+
         captureProcessor =
             AutoCaptureProcessor(
                 aestheticPredictor = aestheticPredictor,
                 onCaptureTriggered = { triggerCapture() },
                 focusController = null, // Will be set via setFocusController() after bind
-            )
+                metricsCollector = metricsCollector,
+                )
     }
 
     // ========================= CAMERA BINDING =========================
@@ -505,6 +514,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraExecutor.shutdown()
         poseHelper.clearPoseLandmarker()
         aestheticPredictor.close()
+        metricsCollector?.close()
         currentCamera = null
         focusController?.reset()
     }

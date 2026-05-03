@@ -4,8 +4,10 @@ import android.graphics.Bitmap
 import android.graphics.PointF
 import android.graphics.Rect
 import android.util.Log
+import com.example.autophotopose.metrics.PerformanceMetricsCollector
 import com.example.autophotopose.ui.AestheticPredictor
 import kotlin.math.hypot
+import kotlin.math.max
 
 // ========================= DATA CLASS =========================
 
@@ -19,6 +21,7 @@ class AutoCaptureProcessor(
     private val onCaptureTriggered: () -> Unit,
     private var focusController: PersonFocusController? = null,
     private val config: Config = Config(),
+    private val metricsCollector: PerformanceMetricsCollector? = null,
 ) {
     companion object {
         private const val TAG = "AutoCapture"
@@ -83,51 +86,72 @@ class AutoCaptureProcessor(
         imageAnalysisWidth: Int = 0,
         imageAnalysisHeight: Int = 0,
     ): Boolean {
-        if (isCapturing) return false
+        Log.d("MetricsDebug", "processFrame called | bitmap: ${bitmap.width}x${bitmap.height}")
+        Log.d("MetricsDebug", "metricsCollector is null: ${metricsCollector == null}")
+        // === METRICS: Start timing ===
+        val frameStartNs = System.nanoTime()
 
-        // Validate bitmap before processing
-        if (bitmap.isRecycled) {
-            Log.w(TAG, "Skipping frame: bitmap is already recycled")
-            return false
-        }
+        // Variables for logging decision (initialized with defaults)
+        var velocity = 0f
+        var score = 0f
+        var decision = "processed"
+        var reason = "none"
+        var triggered: Boolean
 
-        // 1. Pose Validation
-        if (!isValidPose(resultBundle)) return false
-
-        val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return false
-        val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
-
-        // 2. Pose Change Detection
-        val velocity = calculateVelocity(landmarks, lastLandmarks)
-        val isPoseChanged = velocity > config.poseChangeThreshold
-
-        if (isPoseChanged) {
-            analysisBuffer.clear()
-            lastLandmarks = landmarks
-            shotsInSession = 0
-            Log.d(TAG, "New pose detected → buffer cleared")
-            val newRoi = getPersonRoi(bitmap, resultBundle)
-            if (newRoi != null) {
-                cachedRoi = newRoi
-                roiNormalizedCenter.x = newRoi.centerX().toFloat() / bitmap.width
-                roiNormalizedCenter.y = newRoi.centerY().toFloat() / bitmap.height
-
-                focusController?.onRoiCenterChanged(
-                    normCenterX = roiNormalizedCenter.x,
-                    normCenterY = roiNormalizedCenter.y,
-                    imageWidth = imageAnalysisWidth,
-                    imageHeight = imageAnalysisHeight
-                )
+        try {
+            // 1. Early rejections
+            if (isCapturing) {
+                decision = "rejected"; reason = "capturing"; return false
             }
 
-            return false
-        }
+            if (bitmap.isRecycled) {
+                Log.w(TAG, "Skipping frame: bitmap is already recycled")
+                decision = "rejected"; reason = "bitmap_recycled"; return false
+            }
 
-        // 3. ROI + Aesthetic Score
-        val roiRect = cachedRoi ?: getPersonRoi(bitmap, resultBundle) ?: return false
+            // 2. Pose Validation
+            if (!isValidPose(resultBundle)) {
+                decision = "rejected"; reason = "invalid_pose"; return false
+            }
 
-        val roiBitmap =
-            try {
+            val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: run {
+                decision = "rejected"; reason = "no_landmarks"; return false
+            }
+            val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
+
+            // 3. Pose Change Detection
+            velocity = calculateVelocity(landmarks, lastLandmarks)
+            val isPoseChanged = velocity > config.poseChangeThreshold
+
+            if (isPoseChanged) {
+                analysisBuffer.clear()
+                lastLandmarks = landmarks
+                shotsInSession = 0
+                Log.d(TAG, "New pose detected → buffer cleared")
+
+                val newRoi = getPersonRoi(bitmap, resultBundle)
+                if (newRoi != null) {
+                    cachedRoi = newRoi
+                    roiNormalizedCenter.x = newRoi.centerX().toFloat() / bitmap.width
+                    roiNormalizedCenter.y = newRoi.centerY().toFloat() / bitmap.height
+
+                    focusController?.onRoiCenterChanged(
+                        normCenterX = roiNormalizedCenter.x,
+                        normCenterY = roiNormalizedCenter.y,
+                        imageWidth = imageAnalysisWidth,
+                        imageHeight = imageAnalysisHeight
+                    )
+                }
+                decision = "rejected"; reason = "pose_changed"
+                return false
+            }
+
+            // 4. ROI + Aesthetic Score
+            val roiRect = cachedRoi ?: getPersonRoi(bitmap, resultBundle) ?: run {
+                decision = "rejected"; reason = "no_roi"; return false
+            }
+
+            val roiBitmap = try {
                 Bitmap.createBitmap(
                     bitmap,
                     roiRect.left,
@@ -137,36 +161,66 @@ class AutoCaptureProcessor(
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to create ROI bitmap", e)
-                return false
+                decision = "rejected"; reason = "roi_error"; return false
             }
 
-        val score = aestheticPredictor.predictAesthetic(roiBitmap)
+            score = aestheticPredictor.predictAesthetic(roiBitmap)
+            roiBitmap.recycle()
 
-        // Recycle immediately to save memory
-        roiBitmap.recycle()
+            // 5. Add to Buffer
+            val now = System.currentTimeMillis()
+            analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
+            updateFrameIntervalEstimate(now)
+            trimBuffer(now)
+            lastLandmarks = landmarks
 
-        // 4. Add to Buffer
-        val now = System.currentTimeMillis()
-        analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
-        updateFrameIntervalEstimate(now)
-        trimBuffer(now)
-        lastLandmarks = landmarks
+            Log.d(
+                TAG,
+                "Frame buffered | score=${score.format(2)}, vel=${velocity.format(3)}, " +
+                    "buffer=${analysisBuffer.size}",
+            )
 
-        Log.d(
-            TAG,
-            "Frame buffered | score=${score.format(2)}, vel=${velocity.format(3)}, " +
-                "buffer=${analysisBuffer.size}",
-        )
+            updateStabilityWindow(velocity, now)
 
-        updateStabilityWindow(velocity, now)
+            // 6. Check Trigger
+            triggered = shouldTrigger()
+            if (triggered) {
+                onCaptureTriggered()
+                decision = "accepted"
+                reason = "peak_stable"
+            } else {
+                decision = "rejected"
+                reason = determineRejectionReason(velocity, score)
+            }
 
-        // 5. Check Trigger
-        if (shouldTrigger()) {
-            onCaptureTriggered()
-            return true
+            return triggered
+
+        } finally {
+            val frameEndNs = System.nanoTime()
+            val latencyMs = (frameEndNs - frameStartNs) / 1_000_000f
+            Log.d("MetricsDebug", "Attempting to log: velocity=$velocity, score=$score, decision=$decision")
+
+            metricsCollector?.logFrame(
+                velocity = velocity,
+                score = score,
+                decision = decision,
+                reason = reason,
+                latencyMs = latencyMs
+            )
+            Log.d("MetricsDebug", "logFrame called (if collector was not null)")
         }
+    }
 
-        return true
+    /**
+     * Helper to determine rejection reason for analytics.
+     */
+    private fun determineRejectionReason(velocity: Float, score: Float): String {
+        return when {
+            velocity > config.finalFrameVelocityThreshold -> "velocity_final_high"
+            velocity > config.stableVelocityThreshold -> "velocity_unstable"
+            score < 3.5f -> "score_low"
+            else -> "other_criteria"
+        }
     }
 
     /**
@@ -310,7 +364,7 @@ class AutoCaptureProcessor(
 
         val allowNearPeak = currentFrame.score >= maxScore * 0.88f
 
-        val minAcceptableScore = kotlin.math.max(3.5f, lastSavedScore * 0.97f)
+        val minAcceptableScore = max(3.5f, lastSavedScore * 0.97f)
         val allowRelative = currentFrame.score >= minAcceptableScore
 
         if (!isPeak && !allowNearPeak && !allowRelative) {
