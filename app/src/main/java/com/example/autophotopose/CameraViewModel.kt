@@ -31,11 +31,13 @@ import androidx.core.graphics.scale
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
+import com.example.autophotopose.core.SystemTimeProvider
+import com.example.autophotopose.core.TimeProvider
+import com.example.autophotopose.evaluation.VideoTestLauncher
 import com.example.autophotopose.ui.AestheticPredictor
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -51,6 +53,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         private const val JPEG_QUALITY_SAVE = 95
         private val ANALYSIS_RESOLUTION = Size(1280, 960)
     }
+
+    private val _testPreview = MutableStateFlow<Bitmap?>(null)
+    val testPreview: StateFlow<Bitmap?> = _testPreview
 
     private var currentAnalysisWidth: Int = 0
     private var currentAnalysisHeight: Int = 0
@@ -69,6 +74,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     // ========================= ML & PROCESSING =========================
     private val aestheticPredictor = AestheticPredictor(appContext)
+    private val timeProvider: TimeProvider = SystemTimeProvider()
     private lateinit var poseHelper: PoseLandmarkerHelper
     private lateinit var captureProcessor: AutoCaptureProcessor
 
@@ -93,6 +99,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         Log.d(TAG, "Initializing ViewModel")
         initializeMLComponents()
         loadLastPhotoFromGallery()
+
+        // Start video evaluation test automatically (for testing only)
+        // Comment out this line for production builds
+        runVideoEvaluationTest()
     }
 
     private fun initializeMLComponents() {
@@ -102,7 +112,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 runningMode = RunningMode.LIVE_STREAM,
                 poseLandmarkerHelperListener =
                     object : PoseLandmarkerHelper.LandmarkerListener {
-                        override fun onError(error: String, errorCode: Int) {
+                        override fun onError(
+                            error: String,
+                            errorCode: Int,
+                        ) {
                             Log.e(TAG, "Pose Landmarker error [$errorCode]: $error")
                         }
 
@@ -114,9 +127,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         captureProcessor =
             AutoCaptureProcessor(
+                timeProvider = timeProvider,
                 aestheticPredictor = aestheticPredictor,
                 onCaptureTriggered = { triggerCapture() },
-                focusController = null, // Will be set via setFocusController() after bind
+                focusController = null,
             )
     }
 
@@ -148,15 +162,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             try {
                 provider.unbindAll()
-                currentCamera = provider.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    preview,
-                    imageCapture,
-                    imageAnalysis
-                )
+                currentCamera =
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview,
+                        imageCapture,
+                        imageAnalysis,
+                    )
 
-                // Initialize focus components
                 initializeFocusComponents()
 
                 Log.d(TAG, "Camera bound successfully. Front: ${_uiState.value.isFrontCamera}")
@@ -172,15 +186,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun initializeFocusComponents() {
         val camera = currentCamera ?: return
 
-        meteringPointFactory = SurfaceOrientedMeteringPointFactory(
-            ANALYSIS_RESOLUTION.width.toFloat(),
-            ANALYSIS_RESOLUTION.height.toFloat()
-        )
+        meteringPointFactory =
+            SurfaceOrientedMeteringPointFactory(
+                ANALYSIS_RESOLUTION.width.toFloat(),
+                ANALYSIS_RESOLUTION.height.toFloat(),
+            )
 
-        focusController = PersonFocusController(
-            cameraControl = camera.cameraControl,
-            meteringPointFactory = meteringPointFactory!!
-        )
+        focusController =
+            PersonFocusController(
+                cameraControl = camera.cameraControl,
+                meteringPointFactory = meteringPointFactory!!,
+            )
 
         captureProcessor.setFocusController(focusController)
 
@@ -188,14 +204,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun createImageAnalysis(): ImageAnalysis {
-        val resolutionSelector = ResolutionSelector.Builder()
-            .setResolutionStrategy(
-                ResolutionStrategy(
-                    ANALYSIS_RESOLUTION,
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+        val resolutionSelector =
+            ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        ANALYSIS_RESOLUTION,
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                    ),
                 )
-            )
-            .build()
+                .build()
 
         return ImageAnalysis.Builder()
             .setResolutionSelector(resolutionSelector)
@@ -248,7 +265,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             bitmap = bitmap,
             resultBundle = resultBundle,
             imageAnalysisWidth = ANALYSIS_RESOLUTION.width,
-            imageAnalysisHeight = ANALYSIS_RESOLUTION.height
+            imageAnalysisHeight = ANALYSIS_RESOLUTION.height,
         )
     }
 
@@ -258,14 +275,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        // val delayMs = AutoCaptureProcessor.Config().targetDelayMs
-        // Log.d(TAG, "=== CAPTURE TRIGGERED === (Delay: ${delayMs}ms)")
-        Log.d(TAG, "=== CAPTURE TRIGGERED ===")
+        Log.d(TAG, "Capture triggered")
         captureProcessor.notifyCaptureStarted()
         _captureTrigger.value++
 
         viewModelScope.launch {
-            // delay(delayMs)
             takePicture()
         }
     }
@@ -378,7 +392,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun loadThumbnailSafely(uri: android.net.Uri, targetSize: Int): Bitmap? {
+    private fun loadThumbnailSafely(
+        uri: android.net.Uri,
+        targetSize: Int,
+    ): Bitmap? {
         return try {
             when {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
@@ -429,7 +446,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun calculateSampleSize(originalWidth: Int, originalHeight: Int, targetSize: Int): Int {
+    private fun calculateSampleSize(
+        originalWidth: Int,
+        originalHeight: Int,
+        targetSize: Int,
+    ): Int {
         var sampleSize = 1
         if (originalHeight > targetSize || originalWidth > targetSize) {
             val halfHeight = originalHeight / 2
@@ -496,6 +517,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.value = _uiState.value.copy(isFrontCamera = newFrontState)
         captureProcessor.reset()
         createImageCapture()
+    }
+
+    fun runVideoEvaluationTest() {
+        viewModelScope.launch {
+            VideoTestLauncher.startEvaluation(getApplication())
+        }
     }
 
     // ========================= CLEANUP =========================

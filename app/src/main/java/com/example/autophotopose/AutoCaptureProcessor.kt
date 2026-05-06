@@ -4,17 +4,21 @@ import android.graphics.Bitmap
 import android.graphics.PointF
 import android.graphics.Rect
 import android.util.Log
+import com.example.autophotopose.core.TimeProvider
 import com.example.autophotopose.ui.AestheticPredictor
 import kotlin.math.hypot
 
-// ========================= DATA CLASS =========================
-
-/**
- * Lightweight data class for landmark coordinates.
- */
 data class Landmark(val x: Float, val y: Float)
 
+data class AnalysisFrame(
+    val timestamp: Long,
+    val score: Float,
+    val velocity: Float,
+    val landmarks: List<Landmark>,
+)
+
 class AutoCaptureProcessor(
+    private val timeProvider: TimeProvider,
     private val aestheticPredictor: AestheticPredictor,
     private val onCaptureTriggered: () -> Unit,
     private var focusController: PersonFocusController? = null,
@@ -49,14 +53,6 @@ class AutoCaptureProcessor(
         val maxAllowedSpikes: Int = 1,
     )
 
-    private data class AnalysisFrame(
-        val timestamp: Long,
-        val score: Float,
-        val velocity: Float,
-        val landmarks: List<Landmark>,
-    )
-
-    // ================= STATE =================
     private val analysisBuffer = ArrayDeque<AnalysisFrame>(40)
     private var lastLandmarks: List<Landmark>? = null
     private var lastSavedScore = 5f
@@ -67,37 +63,29 @@ class AutoCaptureProcessor(
     private var cachedRoi: Rect? = null
     private var roiNormalizedCenter = PointF(0.5f, 0.5f)
     private var shotsInSession: Int = 0
-    // FPS estimation for adaptive frame-based thresholds
     private var avgFrameIntervalMs: Float = 33f
     private var lastFrameTimestamp: Long = 0L
-    // ================= PUBLIC API =================
+
     val isReady: Boolean get() = !isCapturing
 
-    /**
-     * Processes a new frame with detected pose.
-     * @return true if frame was accepted into buffer, false if rejected early
-     */
     fun processFrame(
         bitmap: Bitmap,
         resultBundle: PoseLandmarkerHelper.ResultBundle,
         imageAnalysisWidth: Int = 0,
         imageAnalysisHeight: Int = 0,
     ): Boolean {
-        if (isCapturing) return false
-
-        // Validate bitmap before processing
         if (bitmap.isRecycled) {
             Log.w(TAG, "Skipping frame: bitmap is already recycled")
             return false
         }
 
-        // 1. Pose Validation
+        if (isCapturing) return false
+
         if (!isValidPose(resultBundle)) return false
 
         val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return false
         val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
 
-        // 2. Pose Change Detection
         val velocity = calculateVelocity(landmarks, lastLandmarks)
         val isPoseChanged = velocity > config.poseChangeThreshold
 
@@ -105,7 +93,7 @@ class AutoCaptureProcessor(
             analysisBuffer.clear()
             lastLandmarks = landmarks
             shotsInSession = 0
-            Log.d(TAG, "New pose detected → buffer cleared")
+            Log.d(TAG, "New pose detected, buffer cleared")
             val newRoi = getPersonRoi(bitmap, resultBundle)
             if (newRoi != null) {
                 cachedRoi = newRoi
@@ -116,14 +104,12 @@ class AutoCaptureProcessor(
                     normCenterX = roiNormalizedCenter.x,
                     normCenterY = roiNormalizedCenter.y,
                     imageWidth = imageAnalysisWidth,
-                    imageHeight = imageAnalysisHeight
+                    imageHeight = imageAnalysisHeight,
                 )
             }
-
             return false
         }
 
-        // 3. ROI + Aesthetic Score
         val roiRect = cachedRoi ?: getPersonRoi(bitmap, resultBundle) ?: return false
 
         val roiBitmap =
@@ -142,11 +128,7 @@ class AutoCaptureProcessor(
 
         val score = aestheticPredictor.predictAesthetic(roiBitmap)
 
-        // Recycle immediately to save memory
-        roiBitmap.recycle()
-
-        // 4. Add to Buffer
-        val now = System.currentTimeMillis()
+        val now = timeProvider.currentTimeMillis()
         analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
         updateFrameIntervalEstimate(now)
         trimBuffer(now)
@@ -154,25 +136,23 @@ class AutoCaptureProcessor(
 
         Log.d(
             TAG,
-            "Frame buffered | score=${score.format(2)}, vel=${velocity.format(3)}, " +
-                "buffer=${analysisBuffer.size}",
+            "Frame buffered | score=${score.format(2)}, vel=${velocity.format(3)}, buffer=${analysisBuffer.size}",
         )
 
         updateStabilityWindow(velocity, now)
 
-        // 5. Check Trigger
         if (shouldTrigger()) {
             onCaptureTriggered()
             return true
         }
 
-        return true
+        return false
     }
 
-    /**
-     * Updates the continuous stability window state based on current velocity.
-     */
-    private fun updateStabilityWindow(velocity: Float, now: Long) {
+    private fun updateStabilityWindow(
+        velocity: Float,
+        now: Long,
+    ) {
         val stableThreshold = config.continuousStableVelocityThreshold
         val resetThreshold = stableThreshold * 1.6f
 
@@ -200,14 +180,12 @@ class AutoCaptureProcessor(
 
     fun notifyCaptureStarted() {
         isCapturing = true
-        lastTriggerTime = System.currentTimeMillis()
+        lastTriggerTime = timeProvider.currentTimeMillis()
         Log.d(TAG, "Capture started. Processor locked.")
     }
 
     fun notifyCaptureFinished(score: Float? = null) {
         isCapturing = false
-
-        // Reset stability window after capture
         stabilityWindowStartMs = 0L
         consecutiveStableFrames = 0
         Log.d(TAG, "Stability window reset after capture")
@@ -235,9 +213,8 @@ class AutoCaptureProcessor(
         Log.d(TAG, "Processor reset.")
     }
 
-    // ================= TRIGGER LOGIC =================
     private fun shouldTrigger(): Boolean {
-        val now = System.currentTimeMillis()
+        val now = timeProvider.currentTimeMillis()
 
         if (analysisBuffer.size < config.minBufferFrames) {
             return false
@@ -248,12 +225,13 @@ class AutoCaptureProcessor(
 
         val currentFrame = recent.last()
 
-        // === 1. CONTINUOUS STABILITY WINDOW CHECK ===
-        val stabilityDuration = if (stabilityWindowStartMs > 0L) {
-            now - stabilityWindowStartMs
-        } else 0L
+        val stabilityDuration =
+            if (stabilityWindowStartMs > 0L) {
+                now - stabilityWindowStartMs
+            } else {
+                0L
+            }
 
-        // Calculate required frames based on current FPS
         val requiredStableFrames =
             ((config.continuousStableMs / avgFrameIntervalMs.coerceAtLeast(30f)) + 0.5f)
                 .toInt()
@@ -268,7 +246,7 @@ class AutoCaptureProcessor(
                 TAG,
                 "Trigger REJECTED: continuous stability not met " +
                     "(duration=${stabilityDuration}ms < ${config.continuousStableMs}ms, " +
-                    "frames=$consecutiveStableFrames < $requiredStableFrames)"
+                    "frames=$consecutiveStableFrames < $requiredStableFrames)",
             )
             return false
         }
@@ -281,26 +259,24 @@ class AutoCaptureProcessor(
 
             if (avgVel > config.freezeAvgThreshold ||
                 maxVel > config.freezeMaxThreshold ||
-                spikes > config.maxAllowedSpikes) {
+                spikes > config.maxAllowedSpikes
+            ) {
                 Log.d(TAG, "Freeze window REJECTED | avg=${avgVel.format(3)}, max=${maxVel.format(3)}, spikes=$spikes")
                 return false
             }
         }
 
-        // STRICT FINAL FRAME CHECK
         if (currentFrame.velocity > config.finalFrameVelocityThreshold) {
             Log.d(TAG, "Trigger REJECTED: final frame velocity too high (${currentFrame.velocity.format(3)})")
             return false
         }
 
-        // 3. VALID FRAMES COUNT
         val validFrames = recent.filter { it.velocity < config.stableVelocityThreshold }
         if (validFrames.size < config.minValidFrames) {
             Log.d(TAG, "Trigger REJECTED: not enough valid frames (${validFrames.size})")
             return false
         }
 
-        // 4. PEAK DETECTION
         val maxScore = validFrames.maxOf { it.score }
         val prevScore = recent.getOrNull(recent.lastIndex - 1)?.score ?: 0f
 
@@ -317,28 +293,25 @@ class AutoCaptureProcessor(
             Log.d(
                 TAG,
                 "Trigger REJECTED: not peak/near-peak/relative " +
-                    "(curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)}, min=$minAcceptableScore)"
+                    "(curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)}, min=$minAcceptableScore)",
             )
             return false
         }
 
-        // 5. VELOCITY-ADAPTIVE COOLDOWN
         val timeSinceLast = now - lastTriggerTime
 
-        // Base cooldown depends on score quality
         val isBetterThanLast = currentFrame.score > lastSavedScore * config.scoreImprovementFactor
         val isHighQuality = currentFrame.score > config.highQualityThreshold
         val baseCooldown = if (isBetterThanLast || isHighQuality) config.cooldownImproved else config.cooldownNormal
 
-        // Adaptive cooldown: shorter when pose is more stable (direct velocity mapping)
-        val adaptiveCooldown = when {
-            currentFrame.velocity < 0.04f -> 800L   // Rock steady: fast burst
-            currentFrame.velocity < 0.08f -> 1200L   // Very stable: moderate pace
-            currentFrame.velocity < 0.15f -> 2000L   // Slight movement: slower
-            else -> baseCooldown                      // Moving: normal cooldown
-        }.coerceAtMost(baseCooldown) // Never exceed base cooldown
+        val adaptiveCooldown =
+            when {
+                currentFrame.velocity < 0.04f -> 800L
+                currentFrame.velocity < 0.08f -> 1200L
+                currentFrame.velocity < 0.15f -> 2000L
+                else -> baseCooldown
+            }.coerceAtMost(baseCooldown)
 
-        // 6. SESSION SHOT LIMIT
         if (timeSinceLast > 5000L) {
             shotsInSession = 0
         }
@@ -347,12 +320,11 @@ class AutoCaptureProcessor(
             Log.d(
                 TAG,
                 "Trigger REJECTED: cooldown (${timeSinceLast}ms < ${adaptiveCooldown}ms) " +
-                    "or session limit ($shotsInSession/4)"
+                    "or session limit ($shotsInSession/4)",
             )
             return false
         }
 
-        // Update session counter
         shotsInSession++
 
         Log.d(
@@ -360,15 +332,11 @@ class AutoCaptureProcessor(
             "Trigger ACCEPTED | score=${currentFrame.score.format(2)}, " +
                 "vel=${currentFrame.velocity.format(3)}, " +
                 "stable_window=${stabilityDuration}ms/$consecutiveStableFrames frames, " +
-                "cooldown=${adaptiveCooldown}ms, session=$shotsInSession/4"
+                "cooldown=${adaptiveCooldown}ms, session=$shotsInSession/4",
         )
         return true
     }
 
-    // ================= HELPERS =================
-    /**
-     * Sets or updates the focus controller after processor initialization.
-     */
     fun setFocusController(controller: PersonFocusController?) {
         this.focusController = controller
         Log.d(TAG, "Focus controller ${if (controller != null) "attached" else "detached"}")
@@ -376,40 +344,33 @@ class AutoCaptureProcessor(
 
     private fun calculateVelocity(
         current: List<Landmark>,
-        previous: List<Landmark>?
+        previous: List<Landmark>?,
     ): Float {
         if (previous == null || current.size != previous.size) return 1.0f
 
-        // Normalize displacement by shoulder width for scale invariance
-        val shoulderWidth = hypot(
-            (current[12].x - current[11].x).toDouble(),
-            (current[12].y - current[11].y).toDouble()
-        ).toFloat().coerceAtLeast(0.08f)
+        val shoulderWidth =
+            hypot(
+                (current[12].x - current[11].x).toDouble(),
+                (current[12].y - current[11].y).toDouble(),
+            ).toFloat().coerceAtLeast(0.08f)
 
-        // Helper: compute normalized Euclidean distance for a landmark index
         fun dist(i: Int): Float {
             val dx = (current[i].x - previous[i].x).toDouble()
             val dy = (current[i].y - previous[i].y).toDouble()
             return hypot(dx, dy).toFloat() / shoulderWidth
         }
 
-        val core = listOf(0, 11, 12, 23, 24)           // Nose, shoulders, hips (high stability weight)
-        val secondary = listOf(13, 14, 25, 26)         // Elbows, knees (moderate movement tolerance)
-        val extremities = listOf(15, 16, 27, 28)       // Wrists, ankles (ignore tremor, wind, footwear noise)
+        val core = listOf(0, 11, 12, 23, 24)
+        val secondary = listOf(13, 14, 25, 26)
+        val extremities = listOf(15, 16, 27, 28)
 
-        // Average velocity per group
         val coreVel = core.map { dist(it) }.average().toFloat()
         val secondaryVel = secondary.map { dist(it) }.average().toFloat()
         val extremitiesVel = extremities.map { dist(it) }.average().toFloat()
 
-        // Weighted average: core dominates, extremities have minimal impact
         val avg = coreVel * 0.6f + secondaryVel * 0.3f + extremitiesVel * 0.1f
-
-        // Safety fallback: if any core point moves significantly,
-        // ensure overall velocity reflects it (prevents "still hands, moving torso" false positives)
         val maxCore = core.maxOf { dist(it) }
 
-        // Return the higher of weighted avg or core-max scaled, to avoid masking body motion
         return maxOf(avg, maxCore * 0.9f)
     }
 
@@ -467,15 +428,10 @@ class AutoCaptureProcessor(
         return reliablePoints >= 14 && area > 0.06f && spread > 0.6f
     }
 
-    /**
-     * Updates the estimated frame interval using exponential moving average.
-     * Filters out anomalies (accepts 5-60 FPS range: 16ms - 200ms).
-     */
     private fun updateFrameIntervalEstimate(now: Long) {
         if (lastFrameTimestamp > 0L) {
             val interval = now - lastFrameTimestamp
             if (interval in 16..200) {
-                // EMA: 80% previous value + 20% new measurement for smooth convergence
                 avgFrameIntervalMs = avgFrameIntervalMs * 0.8f + interval * 0.2f
             }
         }
@@ -491,4 +447,6 @@ class AutoCaptureProcessor(
     }
 
     private fun Float.format(digits: Int): String = "%.${digits}f".format(this)
+
+    fun getLastAnalysisFrame() = analysisBuffer.lastOrNull()
 }

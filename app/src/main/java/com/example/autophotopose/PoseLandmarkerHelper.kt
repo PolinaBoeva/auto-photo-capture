@@ -43,9 +43,6 @@ class PoseLandmarkerHelper(
 
     private var poseLandmarker: PoseLandmarker? = null
 
-    /**
-     * Last processed frame bitmap for use in AutoCaptureProcessor.
-     */
     @Volatile
     var lastFrameBitmap: Bitmap? = null
         private set
@@ -111,10 +108,6 @@ class PoseLandmarkerHelper(
         }
     }
 
-    /**
-     * Processes ImageProxy from CameraX.
-     * Converts to Bitmap, applies rotation/mirror, and sends to MediaPipe.
-     */
     @androidx.annotation.OptIn(ExperimentalGetImage::class)
     fun detectLiveStream(
         imageProxy: ImageProxy,
@@ -122,39 +115,37 @@ class PoseLandmarkerHelper(
     ) {
         val startTime = SystemClock.uptimeMillis()
 
-        // 1. Convert ImageProxy to Bitmap using KTX function
-        val bitmapBuffer = createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888,
-        )
+        val bitmapBuffer =
+            createBitmap(
+                imageProxy.width,
+                imageProxy.height,
+                Bitmap.Config.ARGB_8888,
+            )
         bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
 
-        // 2. Apply rotation and mirroring
-        val matrix = Matrix().apply {
-            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-            if (isFrontCamera) {
-                // Mirror horizontally around the center
-                postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
+        val matrix =
+            Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                if (isFrontCamera) {
+                    postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
+                }
             }
-        }
 
-        val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer,
-            0,
-            0,
-            bitmapBuffer.width,
-            bitmapBuffer.height,
-            matrix,
-            true,
-        )
+        val rotatedBitmap =
+            Bitmap.createBitmap(
+                bitmapBuffer,
+                0,
+                0,
+                bitmapBuffer.width,
+                bitmapBuffer.height,
+                matrix,
+                true,
+            )
 
-        // Recycle temporary buffer immediately
         bitmapBuffer.recycle()
         lastFrameBitmap = rotatedBitmap
 
         try {
-            // 3. Create MPImage from Bitmap and send to MediaPipe
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
             poseLandmarker?.detectAsync(mpImage, startTime)
         } catch (e: Exception) {
@@ -166,6 +157,35 @@ class PoseLandmarkerHelper(
         val processingTime = SystemClock.uptimeMillis() - startTime
         if (processingTime > 50) {
             Log.w(TAG, "Slow frame pipeline: ${processingTime}ms")
+        }
+    }
+
+    /**
+     * Synchronous detection for testing.
+     * Does NOT recycle input bitmap.
+     */
+    fun detectSyncBitmap(bitmap: Bitmap): ResultBundle? {
+        if (runningMode != RunningMode.IMAGE) {
+            Log.w(TAG, "detectSyncBitmap requires RunningMode.IMAGE")
+            return null
+        }
+
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        return try {
+            val result = poseLandmarker?.detect(mpImage)
+            result?.let {
+                ResultBundle(
+                    results = listOf(it),
+                    inferenceTime = 0L,
+                    inputImageHeight = bitmap.height,
+                    inputImageWidth = bitmap.width,
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Sync detection failed", e)
+            null
+        } finally {
+            mpImage.close()
         }
     }
 
