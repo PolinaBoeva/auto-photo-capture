@@ -35,7 +35,6 @@ import com.example.autophotopose.ui.AestheticPredictor
 import com.example.autophotopose.ui.CameraUiState
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -102,7 +101,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 runningMode = RunningMode.LIVE_STREAM,
                 poseLandmarkerHelperListener =
                     object : PoseLandmarkerHelper.LandmarkerListener {
-                        override fun onError(error: String, errorCode: Int) {
+                        override fun onError(
+                            error: String,
+                            errorCode: Int,
+                        ) {
                             Log.e(TAG, "Pose Landmarker error [$errorCode]: $error")
                         }
 
@@ -116,7 +118,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             AutoCaptureProcessor(
                 aestheticPredictor = aestheticPredictor,
                 onCaptureTriggered = { triggerCapture() },
-                focusController = null, // Will be set via setFocusController() after bind
+                focusController = null,
             )
     }
 
@@ -148,13 +150,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
             try {
                 provider.unbindAll()
-                currentCamera = provider.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    preview,
-                    imageCapture,
-                    imageAnalysis
-                )
+                currentCamera =
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        preview,
+                        imageCapture,
+                        imageAnalysis,
+                    )
 
                 // Initialize focus components
                 initializeFocusComponents()
@@ -172,15 +175,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun initializeFocusComponents() {
         val camera = currentCamera ?: return
 
-        meteringPointFactory = SurfaceOrientedMeteringPointFactory(
-            ANALYSIS_RESOLUTION.width.toFloat(),
-            ANALYSIS_RESOLUTION.height.toFloat()
-        )
+        meteringPointFactory =
+            SurfaceOrientedMeteringPointFactory(
+                ANALYSIS_RESOLUTION.width.toFloat(),
+                ANALYSIS_RESOLUTION.height.toFloat(),
+            )
 
-        focusController = PersonFocusController(
-            cameraControl = camera.cameraControl,
-            meteringPointFactory = meteringPointFactory!!
-        )
+        focusController =
+            PersonFocusController(
+                cameraControl = camera.cameraControl,
+                meteringPointFactory = meteringPointFactory!!,
+            )
 
         captureProcessor.setFocusController(focusController)
 
@@ -188,14 +193,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun createImageAnalysis(): ImageAnalysis {
-        val resolutionSelector = ResolutionSelector.Builder()
-            .setResolutionStrategy(
-                ResolutionStrategy(
-                    ANALYSIS_RESOLUTION,
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+        val resolutionSelector =
+            ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        ANALYSIS_RESOLUTION,
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                    ),
                 )
-            )
-            .build()
+                .build()
 
         return ImageAnalysis.Builder()
             .setResolutionSelector(resolutionSelector)
@@ -248,7 +254,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             bitmap = bitmap,
             resultBundle = resultBundle,
             imageAnalysisWidth = ANALYSIS_RESOLUTION.width,
-            imageAnalysisHeight = ANALYSIS_RESOLUTION.height
+            imageAnalysisHeight = ANALYSIS_RESOLUTION.height,
         )
     }
 
@@ -378,7 +384,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun loadThumbnailSafely(uri: android.net.Uri, targetSize: Int): Bitmap? {
+    private fun loadThumbnailSafely(
+        uri: android.net.Uri,
+        targetSize: Int,
+    ): Bitmap? {
         return try {
             when {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
@@ -429,7 +438,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun calculateSampleSize(originalWidth: Int, originalHeight: Int, targetSize: Int): Int {
+    private fun calculateSampleSize(
+        originalWidth: Int,
+        originalHeight: Int,
+        targetSize: Int,
+    ): Int {
         var sampleSize = 1
         if (originalHeight > targetSize || originalWidth > targetSize) {
             val halfHeight = originalHeight / 2

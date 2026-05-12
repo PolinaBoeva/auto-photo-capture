@@ -123,31 +123,34 @@ class PoseLandmarkerHelper(
         val startTime = SystemClock.uptimeMillis()
 
         // 1. Convert ImageProxy to Bitmap using KTX function
-        val bitmapBuffer = createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888,
-        )
+        val bitmapBuffer =
+            createBitmap(
+                imageProxy.width,
+                imageProxy.height,
+                Bitmap.Config.ARGB_8888,
+            )
         bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
 
         // 2. Apply rotation and mirroring
-        val matrix = Matrix().apply {
-            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-            if (isFrontCamera) {
-                // Mirror horizontally around the center
-                postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
+        val matrix =
+            Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                if (isFrontCamera) {
+                    // Mirror horizontally around the center
+                    postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
+                }
             }
-        }
 
-        val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer,
-            0,
-            0,
-            bitmapBuffer.width,
-            bitmapBuffer.height,
-            matrix,
-            true,
-        )
+        val rotatedBitmap =
+            Bitmap.createBitmap(
+                bitmapBuffer,
+                0,
+                0,
+                bitmapBuffer.width,
+                bitmapBuffer.height,
+                matrix,
+                true,
+            )
 
         // Recycle temporary buffer immediately
         bitmapBuffer.recycle()

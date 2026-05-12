@@ -67,9 +67,11 @@ class AutoCaptureProcessor(
     private var cachedRoi: Rect? = null
     private var roiNormalizedCenter = PointF(0.5f, 0.5f)
     private var shotsInSession: Int = 0
+
     // FPS estimation for adaptive frame-based thresholds
     private var avgFrameIntervalMs: Float = 33f
     private var lastFrameTimestamp: Long = 0L
+
     // ================= PUBLIC API =================
     val isReady: Boolean get() = !isCapturing
 
@@ -116,7 +118,7 @@ class AutoCaptureProcessor(
                     normCenterX = roiNormalizedCenter.x,
                     normCenterY = roiNormalizedCenter.y,
                     imageWidth = imageAnalysisWidth,
-                    imageHeight = imageAnalysisHeight
+                    imageHeight = imageAnalysisHeight,
                 )
             }
 
@@ -172,7 +174,10 @@ class AutoCaptureProcessor(
     /**
      * Updates the continuous stability window state based on current velocity.
      */
-    private fun updateStabilityWindow(velocity: Float, now: Long) {
+    private fun updateStabilityWindow(
+        velocity: Float,
+        now: Long,
+    ) {
         val stableThreshold = config.continuousStableVelocityThreshold
         val resetThreshold = stableThreshold * 1.6f
 
@@ -249,9 +254,12 @@ class AutoCaptureProcessor(
         val currentFrame = recent.last()
 
         // === 1. CONTINUOUS STABILITY WINDOW CHECK ===
-        val stabilityDuration = if (stabilityWindowStartMs > 0L) {
-            now - stabilityWindowStartMs
-        } else 0L
+        val stabilityDuration =
+            if (stabilityWindowStartMs > 0L) {
+                now - stabilityWindowStartMs
+            } else {
+                0L
+            }
 
         // Calculate required frames based on current FPS
         val requiredStableFrames =
@@ -268,7 +276,7 @@ class AutoCaptureProcessor(
                 TAG,
                 "Trigger REJECTED: continuous stability not met " +
                     "(duration=${stabilityDuration}ms < ${config.continuousStableMs}ms, " +
-                    "frames=$consecutiveStableFrames < $requiredStableFrames)"
+                    "frames=$consecutiveStableFrames < $requiredStableFrames)",
             )
             return false
         }
@@ -281,7 +289,8 @@ class AutoCaptureProcessor(
 
             if (avgVel > config.freezeAvgThreshold ||
                 maxVel > config.freezeMaxThreshold ||
-                spikes > config.maxAllowedSpikes) {
+                spikes > config.maxAllowedSpikes
+            ) {
                 Log.d(TAG, "Freeze window REJECTED | avg=${avgVel.format(3)}, max=${maxVel.format(3)}, spikes=$spikes")
                 return false
             }
@@ -317,7 +326,7 @@ class AutoCaptureProcessor(
             Log.d(
                 TAG,
                 "Trigger REJECTED: not peak/near-peak/relative " +
-                    "(curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)}, min=$minAcceptableScore)"
+                    "(curr=${currentFrame.score.format(2)}, max=${maxScore.format(2)}, min=$minAcceptableScore)",
             )
             return false
         }
@@ -331,12 +340,13 @@ class AutoCaptureProcessor(
         val baseCooldown = if (isBetterThanLast || isHighQuality) config.cooldownImproved else config.cooldownNormal
 
         // Adaptive cooldown: shorter when pose is more stable (direct velocity mapping)
-        val adaptiveCooldown = when {
-            currentFrame.velocity < 0.04f -> 800L   // Rock steady: fast burst
-            currentFrame.velocity < 0.08f -> 1200L   // Very stable: moderate pace
-            currentFrame.velocity < 0.15f -> 2000L   // Slight movement: slower
-            else -> baseCooldown                      // Moving: normal cooldown
-        }.coerceAtMost(baseCooldown) // Never exceed base cooldown
+        val adaptiveCooldown =
+            when {
+                currentFrame.velocity < 0.04f -> 800L // Rock steady: fast burst
+                currentFrame.velocity < 0.08f -> 1200L // Very stable: moderate pace
+                currentFrame.velocity < 0.15f -> 2000L // Slight movement: slower
+                else -> baseCooldown // Moving: normal cooldown
+            }.coerceAtMost(baseCooldown) // Never exceed base cooldown
 
         // 6. SESSION SHOT LIMIT
         if (timeSinceLast > 5000L) {
@@ -347,7 +357,7 @@ class AutoCaptureProcessor(
             Log.d(
                 TAG,
                 "Trigger REJECTED: cooldown (${timeSinceLast}ms < ${adaptiveCooldown}ms) " +
-                    "or session limit ($shotsInSession/4)"
+                    "or session limit ($shotsInSession/4)",
             )
             return false
         }
@@ -360,12 +370,13 @@ class AutoCaptureProcessor(
             "Trigger ACCEPTED | score=${currentFrame.score.format(2)}, " +
                 "vel=${currentFrame.velocity.format(3)}, " +
                 "stable_window=${stabilityDuration}ms/$consecutiveStableFrames frames, " +
-                "cooldown=${adaptiveCooldown}ms, session=$shotsInSession/4"
+                "cooldown=${adaptiveCooldown}ms, session=$shotsInSession/4",
         )
         return true
     }
 
     // ================= HELPERS =================
+
     /**
      * Sets or updates the focus controller after processor initialization.
      */
@@ -376,15 +387,16 @@ class AutoCaptureProcessor(
 
     private fun calculateVelocity(
         current: List<Landmark>,
-        previous: List<Landmark>?
+        previous: List<Landmark>?,
     ): Float {
         if (previous == null || current.size != previous.size) return 1.0f
 
         // Normalize displacement by shoulder width for scale invariance
-        val shoulderWidth = hypot(
-            (current[12].x - current[11].x).toDouble(),
-            (current[12].y - current[11].y).toDouble()
-        ).toFloat().coerceAtLeast(0.08f)
+        val shoulderWidth =
+            hypot(
+                (current[12].x - current[11].x).toDouble(),
+                (current[12].y - current[11].y).toDouble(),
+            ).toFloat().coerceAtLeast(0.08f)
 
         // Helper: compute normalized Euclidean distance for a landmark index
         fun dist(i: Int): Float {
@@ -393,9 +405,9 @@ class AutoCaptureProcessor(
             return hypot(dx, dy).toFloat() / shoulderWidth
         }
 
-        val core = listOf(0, 11, 12, 23, 24)           // Nose, shoulders, hips (high stability weight)
-        val secondary = listOf(13, 14, 25, 26)         // Elbows, knees (moderate movement tolerance)
-        val extremities = listOf(15, 16, 27, 28)       // Wrists, ankles (ignore tremor, wind, footwear noise)
+        val core = listOf(0, 11, 12, 23, 24) // Nose, shoulders, hips (high stability weight)
+        val secondary = listOf(13, 14, 25, 26) // Elbows, knees (moderate movement tolerance)
+        val extremities = listOf(15, 16, 27, 28) // Wrists, ankles (ignore tremor, wind, footwear noise)
 
         // Average velocity per group
         val coreVel = core.map { dist(it) }.average().toFloat()

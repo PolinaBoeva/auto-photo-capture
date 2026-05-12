@@ -35,11 +35,12 @@ fun CameraScreen(
     val poseResults = viewModel.poseResults
     val captureTrigger by viewModel.captureTrigger.collectAsState()
 
-    val previewView = remember {
-        PreviewView(context).apply {
-            scaleType = PreviewView.ScaleType.FILL_CENTER
+    val previewView =
+        remember {
+            PreviewView(context).apply {
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
         }
-    }
     val overlayView = remember { OverlayView(context) }
 
     // Changing the camera type (front/main)

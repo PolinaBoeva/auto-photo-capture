@@ -13,19 +13,23 @@ import java.util.concurrent.TimeUnit
 class PersonFocusController(
     private val cameraControl: CameraControl,
     private val meteringPointFactory: MeteringPointFactory,
-    private val config: Config = Config()
+    private val config: Config = Config(),
 ) {
     companion object {
         private const val TAG = "PersonFocus"
     }
 
     data class Config(
-        val focusThrottleMs: Long = 800L,        // Minimum interval between focus requests
-        val minMoveThreshold: Float = 0.02f      // Ignore center shifts smaller than 2% of frame size
+        // Minimum interval between focus requests
+        val focusThrottleMs: Long = 800L,
+        // Ignore center shifts smaller than 2% of frame size
+        val minMoveThreshold: Float = 0.02f,
     )
 
     private var lastFocusTime = 0L
-    private var lastNormalizedCenter = PointF(0.5f, 0.5f) // Normalized coordinates (0.0 to 1.0)
+
+    // Normalized coordinates (0.0 to 1.0)
+    private var lastNormalizedCenter = PointF(0.5f, 0.5f)
 
     /**
      * Called when the person's ROI center changes significantly.
@@ -38,7 +42,7 @@ class PersonFocusController(
         normCenterX: Float,
         normCenterY: Float,
         imageWidth: Int,
-        imageHeight: Int
+        imageHeight: Int,
     ) {
         val now = System.currentTimeMillis()
 
@@ -59,9 +63,10 @@ class PersonFocusController(
 
         // 4. Build and submit focus request (AF only, to avoid exposure shifts)
         val point = meteringPointFactory.createPoint(pixelX, pixelY)
-        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
-            .setAutoCancelDuration(2, TimeUnit.SECONDS)
-            .build()
+        val action =
+            FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                .setAutoCancelDuration(2, TimeUnit.SECONDS)
+                .build()
 
         cameraControl.startFocusAndMetering(action)
         Log.d(TAG, "Focus updated: (${pixelX.toInt()}, ${pixelY.toInt()}) | interval=${now - lastFocusTime}ms")
