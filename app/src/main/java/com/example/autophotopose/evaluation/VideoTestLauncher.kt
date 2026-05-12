@@ -65,10 +65,11 @@ object VideoTestLauncher {
 
             for (videoFile in videoFiles) {
                 Log.d(TAG, "Starting: ${videoFile.name}")
+                processor.reset()
+                timeProvider.setTimeFromPresentationTimeUs(0)
                 runSingleVideo(context, videoFile, processor, timeProvider, poseHelper)
             }
 
-            processor.reset()
             aestheticPredictor.close()
             poseHelper.clearPoseLandmarker()
             Log.d(TAG, "Test completed.")

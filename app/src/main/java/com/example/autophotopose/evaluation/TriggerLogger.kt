@@ -22,7 +22,6 @@ class TriggerLogger(context: Context, videoName: String) {
         velocity: Float,
         landmarksCount: Int,
     ) {
-        // Use Locale.US for deterministic number formatting (dot as decimal separator)
         writer.appendLine(
             "$timeUs,${String.format(Locale.US, "%.4f", score)},${String.format(Locale.US, "%.4f", velocity)},$landmarksCount",
         )

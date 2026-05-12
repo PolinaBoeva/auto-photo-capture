@@ -101,7 +101,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         loadLastPhotoFromGallery()
 
         // Start video evaluation test automatically (for testing only)
-        // Comment out this line for production builds
         runVideoEvaluationTest()
     }
 

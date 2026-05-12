@@ -81,10 +81,16 @@ class AutoCaptureProcessor(
 
         if (isCapturing) return false
 
-        if (!isValidPose(resultBundle)) return false
+        if (!isValidPose(resultBundle)) {
+            Log.w(TAG, "Pose validation FAILED")
+            return false
+        }
+        Log.d(TAG, "Pose validation PASSED")
 
         val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return false
         val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
+        Log.d(TAG, "Landmarks count: ${landmarksList.size}")
+
 
         val velocity = calculateVelocity(landmarks, lastLandmarks)
         val isPoseChanged = velocity > config.poseChangeThreshold
@@ -210,6 +216,7 @@ class AutoCaptureProcessor(
         focusController?.reset()
         avgFrameIntervalMs = 100f
         lastFrameTimestamp = 0L
+        lastTriggerTime = 0L
         Log.d(TAG, "Processor reset.")
     }
 
@@ -412,20 +419,39 @@ class AutoCaptureProcessor(
     }
 
     private fun isValidPose(resultBundle: PoseLandmarkerHelper.ResultBundle): Boolean {
-        val landmarks = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return false
-        if (landmarks.size < 16) return false
+        val landmarks = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: run {
+            Log.w(TAG, "Pose validation FAILED: no landmarks")
+            return false
+        }
 
-        val reliablePoints =
-            landmarks.count {
-                it.visibility().orElse(0f) > 0.6f && it.presence().orElse(0f) > 0.5f
-            }
+        if (landmarks.size < 16) {
+            Log.w(TAG, "Pose validation FAILED: only ${landmarks.size} landmarks")
+            return false
+        }
+
+        val reliablePoints = landmarks.count {
+            it.visibility().orElse(0f) > 0.6f && it.presence().orElse(0f) > 0.5f
+        }
 
         val xs = landmarks.map { it.x() }
         val ys = landmarks.map { it.y() }
         val area = (xs.max() - xs.min()) * (ys.max() - ys.min())
         val spread = (xs.max() - xs.min()) + (ys.max() - ys.min())
 
-        return reliablePoints >= 14 && area > 0.06f && spread > 0.6f
+        if (reliablePoints < 14) {
+            Log.w(TAG, "Pose validation FAILED: reliablePoints=$reliablePoints < 14")
+            return false
+        }
+        if (area <= 0.03f) {
+            Log.w(TAG, "Pose validation FAILED: area=$area <= 0.03 (person too small?)")
+            return false
+        }
+        if (spread <= 0.4f) {
+            Log.w(TAG, "Pose validation FAILED: spread=$spread <= 0.4 (person too small?)")
+            return false
+        }
+
+        return true
     }
 
     private fun updateFrameIntervalEstimate(now: Long) {
