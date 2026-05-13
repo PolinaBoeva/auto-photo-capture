@@ -147,7 +147,7 @@ class VideoFrameSource(private val filePath: String) : FrameSource {
             when (colorFormat) {
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar, // I420
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar, // NV12
-                    -> {
+                -> {
                     // Read Y plane
                     buffer.position(info.offset)
                     buffer.get(nv21, 0, width * height)
