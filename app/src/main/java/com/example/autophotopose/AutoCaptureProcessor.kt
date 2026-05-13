@@ -28,7 +28,7 @@ class AutoCaptureProcessor(
         val minStableMs: Long = 300L,
         val poseChangeThreshold: Float = 0.75f,
         val stableVelocityThreshold: Float = 0.28f,
-        val peakRatio: Float = 0.92f,
+        val peakRatio: Float = 0.85f,
         val targetDelayMs: Long = 80L,
         val bufferWindowMs: Long = 1200L,
         val minBufferFrames: Int = 8,
@@ -39,14 +39,19 @@ class AutoCaptureProcessor(
         val highQualityThreshold: Float = 7.5f,
         val cooldownNormal: Long = 3200L,
         val cooldownImproved: Long = 1800L,
-        val continuousStableMs: Long = 250L,
+        val continuousStableMs: Long = 200L,
         val continuousStableVelocityThreshold: Float = 0.10f,
         val finalFrameVelocityThreshold: Float = 0.10f,
         val minConsecutiveStableFrames: Int = 4,
         val freezeWindowFrames: Int = 4,
-        val freezeAvgThreshold: Float = 0.035f,
-        val freezeMaxThreshold: Float = 0.065f,
-        val maxAllowedSpikes: Int = 1,
+        val freezeAvgThreshold: Float = 0.16f,
+        val freezeMaxThreshold: Float = 0.22f,
+        val maxAllowedSpikes: Int = 4,
+        val landmarkSmoothingAlpha: Float = 0.3f,
+        val farFieldMinPersonArea: Float = 0.12f,
+        val farFieldStableVelocityThreshold: Float = 0.18f,
+        val farFieldResetMultiplier: Float = 1.8f,
+        val farFieldFinalVelocityThreshold: Float = 0.18f,
     )
 
     private data class AnalysisFrame(
@@ -67,6 +72,9 @@ class AutoCaptureProcessor(
     private var cachedRoi: Rect? = null
     private var roiNormalizedCenter = PointF(0.5f, 0.5f)
     private var shotsInSession: Int = 0
+    private var smoothedLandmarks: List<Landmark>? = null
+
+    private var isPoseLockedFarField: Boolean = false
 
     // FPS estimation for adaptive frame-based thresholds
     private var avgFrameIntervalMs: Float = 33f
@@ -97,7 +105,8 @@ class AutoCaptureProcessor(
         if (!isValidPose(resultBundle)) return false
 
         val landmarksList = resultBundle.results.firstOrNull()?.landmarks()?.firstOrNull() ?: return false
-        val landmarks = landmarksList.map { Landmark(it.x(), it.y()) }
+        val rawLandmarks = landmarksList.map { Landmark(it.x(), it.y()) }
+        val landmarks = smoothLandmarks(rawLandmarks)
 
         // 2. Pose Change Detection
         val velocity = calculateVelocity(landmarks, lastLandmarks)
@@ -107,6 +116,10 @@ class AutoCaptureProcessor(
             analysisBuffer.clear()
             lastLandmarks = landmarks
             shotsInSession = 0
+            resetSmoothing()
+            val area = calculatePersonArea(landmarks)
+            isPoseLockedFarField = area < config.farFieldMinPersonArea
+            Log.d(TAG, "New pose detected → mode locked to farField=$isPoseLockedFarField (area=${area.format(2)})")
             Log.d(TAG, "New pose detected → buffer cleared")
             val newRoi = getPersonRoi(bitmap, resultBundle)
             if (newRoi != null) {
@@ -160,10 +173,11 @@ class AutoCaptureProcessor(
                 "buffer=${analysisBuffer.size}",
         )
 
-        updateStabilityWindow(velocity, now)
+        val personArea = calculatePersonArea(landmarks)
+        updateStabilityWindow(velocity, now, isPoseLockedFarField)
 
         // 5. Check Trigger
-        if (shouldTrigger()) {
+        if (shouldTrigger(isPoseLockedFarField)) {
             onCaptureTriggered()
             return true
         }
@@ -177,22 +191,26 @@ class AutoCaptureProcessor(
     private fun updateStabilityWindow(
         velocity: Float,
         now: Long,
+        isFarField: Boolean,
     ) {
-        val stableThreshold = config.continuousStableVelocityThreshold
-        val resetThreshold = stableThreshold * 1.6f
+        val (stableThreshold, resetMultiplier) =
+            if (isFarField) {
+                config.farFieldStableVelocityThreshold to config.farFieldResetMultiplier
+            } else {
+                config.continuousStableVelocityThreshold to 2.0f
+            }
 
-        val isStable = velocity < stableThreshold
-        val isUnstable = velocity > resetThreshold
+        val resetThreshold = stableThreshold * resetMultiplier
 
-        if (isUnstable) {
+        if (velocity > resetThreshold) {
             stabilityWindowStartMs = 0L
             consecutiveStableFrames = 0
             shotsInSession = 0
-            Log.d(TAG, "Stability window HARD RESET (vel=${velocity.format(3)} > ${resetThreshold.format(2)})")
-        } else if (isStable) {
+            Log.d(TAG, "Stability window HARD RESET (vel=${velocity.format(3)} > ${resetThreshold.format(2)}, farField=$isFarField)")
+        } else {
             if (consecutiveStableFrames == 0) {
                 stabilityWindowStartMs = now
-                Log.d(TAG, "Stability window STARTED at $now (vel=${velocity.format(3)})")
+                Log.d(TAG, "Stability window STARTED at $now (vel=${velocity.format(3)}, farField=$isFarField)")
             }
             consecutiveStableFrames++
         }
@@ -237,11 +255,13 @@ class AutoCaptureProcessor(
         focusController?.reset()
         avgFrameIntervalMs = 100f
         lastFrameTimestamp = 0L
+        resetSmoothing()
+        isPoseLockedFarField = false
         Log.d(TAG, "Processor reset.")
     }
 
     // ================= TRIGGER LOGIC =================
-    private fun shouldTrigger(): Boolean {
+    private fun shouldTrigger(isFarField: Boolean): Boolean {
         val now = System.currentTimeMillis()
 
         if (analysisBuffer.size < config.minBufferFrames) {
@@ -297,8 +317,15 @@ class AutoCaptureProcessor(
         }
 
         // STRICT FINAL FRAME CHECK
-        if (currentFrame.velocity > config.finalFrameVelocityThreshold) {
-            Log.d(TAG, "Trigger REJECTED: final frame velocity too high (${currentFrame.velocity.format(3)})")
+        val effectiveFinalThreshold =
+            if (isFarField) {
+                config.farFieldFinalVelocityThreshold
+            } else {
+                config.finalFrameVelocityThreshold
+            }
+
+        if (currentFrame.velocity > effectiveFinalThreshold) {
+            Log.d(TAG, "Trigger REJECTED: final frame velocity too high (${currentFrame.velocity.format(3)}, farField=$isFarField)")
             return false
         }
 
@@ -376,6 +403,43 @@ class AutoCaptureProcessor(
     }
 
     // ================= HELPERS =================
+    private fun calculatePersonArea(landmarks: List<Landmark>): Float {
+        if (landmarks.isEmpty()) return 0f
+        val xs = landmarks.map { it.x }
+        val ys = landmarks.map { it.y }
+        return (xs.max() - xs.min()) * (ys.max() - ys.min())
+    }
+
+    /**
+     * Applies Exponential Moving Average smoothing to landmarks.
+     * Formula: smoothed = prev * (1 - alpha) + current * alpha
+     * Higher alpha = more responsive, less smoothing.
+     */
+    private fun smoothLandmarks(current: List<Landmark>): List<Landmark> {
+        val alpha = config.landmarkSmoothingAlpha
+
+        // First frame: no smoothing, just initialize
+        if (smoothedLandmarks == null || current.size != smoothedLandmarks!!.size) {
+            smoothedLandmarks = current.map { Landmark(it.x, it.y) }
+            return current
+        }
+
+        // Apply EMA to each landmark
+        return current.mapIndexed { i, landmark ->
+            val prev = smoothedLandmarks!![i]
+            Landmark(
+                x = prev.x * (1f - alpha) + landmark.x * alpha,
+                y = prev.y * (1f - alpha) + landmark.y * alpha,
+            )
+        }.also { smoothedLandmarks = it }
+    }
+
+    /**
+     * Resets the smoothing state (call on pose change, reset, etc.)
+     */
+    private fun resetSmoothing() {
+        smoothedLandmarks = null
+    }
 
     /**
      * Sets or updates the focus controller after processor initialization.
@@ -389,8 +453,9 @@ class AutoCaptureProcessor(
         current: List<Landmark>,
         previous: List<Landmark>?,
     ): Float {
-        if (previous == null || current.size != previous.size) return 1.0f
-
+        if (previous == null || current.size < 29 || current.size != previous.size) {
+            return 1.0f
+        }
         // Normalize displacement by shoulder width for scale invariance
         val shoulderWidth =
             hypot(
