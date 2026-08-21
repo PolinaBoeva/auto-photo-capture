@@ -7,9 +7,6 @@ plugins {
 spotless {
     kotlin {
         target("**/*.kt")
-        targetExclude(
-            "opencv/**"
-        )
         ktlint(libs.versions.ktlint.get())
     }
 }

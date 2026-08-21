@@ -5,6 +5,8 @@ import android.graphics.PointF
 import android.graphics.Rect
 import android.util.Log
 import com.example.autophotopose.ui.AestheticPredictor
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.hypot
 
 // ========================= DATA CLASS =========================
@@ -22,6 +24,7 @@ class AutoCaptureProcessor(
 ) {
     companion object {
         private const val TAG = "AutoCapture"
+        private const val MIN_VALID_AESTHETIC_SCORE = 1f
     }
 
     data class Config(
@@ -46,7 +49,7 @@ class AutoCaptureProcessor(
         val freezeWindowFrames: Int = 4,
         val freezeAvgThreshold: Float = 0.16f,
         val freezeMaxThreshold: Float = 0.22f,
-        val maxAllowedSpikes: Int = 4,
+        val maxAllowedSpikes: Int = 1,
         val landmarkSmoothingAlpha: Float = 0.3f,
         val farFieldMinPersonArea: Float = 0.12f,
         val farFieldStableVelocityThreshold: Float = 0.18f,
@@ -75,13 +78,16 @@ class AutoCaptureProcessor(
     private var smoothedLandmarks: List<Landmark>? = null
 
     private var isPoseLockedFarField: Boolean = false
+    private var pendingTriggerScore: Float? = null
 
     // FPS estimation for adaptive frame-based thresholds
     private var avgFrameIntervalMs: Float = 33f
     private var lastFrameTimestamp: Long = 0L
 
+    private val lock = ReentrantLock()
+
     // ================= PUBLIC API =================
-    val isReady: Boolean get() = !isCapturing
+    val isReady: Boolean get() = lock.withLock { !isCapturing }
 
     /**
      * Processes a new frame with detected pose.
@@ -92,6 +98,27 @@ class AutoCaptureProcessor(
         resultBundle: PoseLandmarkerHelper.ResultBundle,
         imageAnalysisWidth: Int = 0,
         imageAnalysisHeight: Int = 0,
+        rotationDegrees: Int = 0,
+        isFrontCamera: Boolean = false,
+    ): Boolean =
+        lock.withLock {
+            processFrameLocked(
+                bitmap,
+                resultBundle,
+                imageAnalysisWidth,
+                imageAnalysisHeight,
+                rotationDegrees,
+                isFrontCamera,
+            )
+        }
+
+    private fun processFrameLocked(
+        bitmap: Bitmap,
+        resultBundle: PoseLandmarkerHelper.ResultBundle,
+        imageAnalysisWidth: Int,
+        imageAnalysisHeight: Int,
+        rotationDegrees: Int,
+        isFrontCamera: Boolean,
     ): Boolean {
         if (isCapturing) return false
 
@@ -126,12 +153,11 @@ class AutoCaptureProcessor(
                 cachedRoi = newRoi
                 roiNormalizedCenter.x = newRoi.centerX().toFloat() / bitmap.width
                 roiNormalizedCenter.y = newRoi.centerY().toFloat() / bitmap.height
-
-                focusController?.onRoiCenterChanged(
-                    normCenterX = roiNormalizedCenter.x,
-                    normCenterY = roiNormalizedCenter.y,
-                    imageWidth = imageAnalysisWidth,
-                    imageHeight = imageAnalysisHeight,
+                notifyFocusOfRoi(
+                    imageAnalysisWidth = imageAnalysisWidth,
+                    imageAnalysisHeight = imageAnalysisHeight,
+                    rotationDegrees = rotationDegrees,
+                    isFrontCamera = isFrontCamera,
                 )
             }
 
@@ -160,6 +186,11 @@ class AutoCaptureProcessor(
         // Recycle immediately to save memory
         roiBitmap.recycle()
 
+        if (score < MIN_VALID_AESTHETIC_SCORE) {
+            Log.w(TAG, "Skipping frame: invalid aesthetic score $score")
+            return false
+        }
+
         // 4. Add to Buffer
         val now = System.currentTimeMillis()
         analysisBuffer.addLast(AnalysisFrame(now, score, velocity, landmarks))
@@ -173,7 +204,6 @@ class AutoCaptureProcessor(
                 "buffer=${analysisBuffer.size}",
         )
 
-        val personArea = calculatePersonArea(landmarks)
         updateStabilityWindow(velocity, now, isPoseLockedFarField)
 
         // 5. Check Trigger
@@ -222,42 +252,54 @@ class AutoCaptureProcessor(
     }
 
     fun notifyCaptureStarted() {
-        isCapturing = true
-        lastTriggerTime = System.currentTimeMillis()
-        Log.d(TAG, "Capture started. Processor locked.")
+        lock.withLock {
+            isCapturing = true
+            lastTriggerTime = System.currentTimeMillis()
+            Log.d(TAG, "Capture started. Processor locked.")
+        }
     }
 
-    fun notifyCaptureFinished(score: Float? = null) {
-        isCapturing = false
+    fun notifyCaptureFinished(
+        score: Float? = null,
+        captureSucceeded: Boolean = true,
+    ) {
+        lock.withLock {
+            isCapturing = false
 
-        // Reset stability window after capture
-        stabilityWindowStartMs = 0L
-        consecutiveStableFrames = 0
-        Log.d(TAG, "Stability window reset after capture")
+            // Reset stability window after capture
+            stabilityWindowStartMs = 0L
+            consecutiveStableFrames = 0
+            Log.d(TAG, "Stability window reset after capture")
 
-        score?.let {
-            lastSavedScore = it
-            Log.d(TAG, "Capture finished. Last saved score: ${it.format(2)}")
-        } ?: run {
-            Log.d(TAG, "Capture finished (no score update).")
+            val resolvedScore = score ?: pendingTriggerScore
+            pendingTriggerScore = null
+            if (captureSucceeded && resolvedScore != null) {
+                lastSavedScore = resolvedScore
+                Log.d(TAG, "Capture finished. Last saved score: ${resolvedScore.format(2)}")
+            } else {
+                Log.d(TAG, "Capture finished (no score update).")
+            }
         }
     }
 
     fun reset() {
-        analysisBuffer.clear()
-        lastLandmarks = null
-        isCapturing = false
-        stabilityWindowStartMs = 0L
-        consecutiveStableFrames = 0
-        shotsInSession = 0
-        cachedRoi = null
-        roiNormalizedCenter.set(0.5f, 0.5f)
-        focusController?.reset()
-        avgFrameIntervalMs = 100f
-        lastFrameTimestamp = 0L
-        resetSmoothing()
-        isPoseLockedFarField = false
-        Log.d(TAG, "Processor reset.")
+        lock.withLock {
+            analysisBuffer.clear()
+            lastLandmarks = null
+            isCapturing = false
+            stabilityWindowStartMs = 0L
+            consecutiveStableFrames = 0
+            shotsInSession = 0
+            cachedRoi = null
+            roiNormalizedCenter.set(0.5f, 0.5f)
+            focusController?.reset()
+            avgFrameIntervalMs = 100f
+            lastFrameTimestamp = 0L
+            resetSmoothing()
+            isPoseLockedFarField = false
+            pendingTriggerScore = null
+            Log.d(TAG, "Processor reset.")
+        }
     }
 
     // ================= TRIGGER LOGIC =================
@@ -272,6 +314,10 @@ class AutoCaptureProcessor(
         if (recent.isEmpty()) return false
 
         val currentFrame = recent.last()
+        if (currentFrame.score < MIN_VALID_AESTHETIC_SCORE) {
+            Log.d(TAG, "Trigger REJECTED: invalid aesthetic score ${currentFrame.score}")
+            return false
+        }
 
         // === 1. CONTINUOUS STABILITY WINDOW CHECK ===
         val stabilityDuration =
@@ -389,8 +435,9 @@ class AutoCaptureProcessor(
             return false
         }
 
-        // Update session counter
+        // Update session counter and remember the score that triggered this shot
         shotsInSession++
+        pendingTriggerScore = currentFrame.score
 
         Log.d(
             TAG,
@@ -445,8 +492,55 @@ class AutoCaptureProcessor(
      * Sets or updates the focus controller after processor initialization.
      */
     fun setFocusController(controller: PersonFocusController?) {
-        this.focusController = controller
-        Log.d(TAG, "Focus controller ${if (controller != null) "attached" else "detached"}")
+        lock.withLock {
+            this.focusController = controller
+            Log.d(TAG, "Focus controller ${if (controller != null) "attached" else "detached"}")
+        }
+    }
+
+    private fun notifyFocusOfRoi(
+        imageAnalysisWidth: Int,
+        imageAnalysisHeight: Int,
+        rotationDegrees: Int,
+        isFrontCamera: Boolean,
+    ) {
+        if (imageAnalysisWidth <= 0 || imageAnalysisHeight <= 0) return
+        val analysisNorm =
+            displayNormalizedToAnalysis(
+                roiNormalizedCenter.x,
+                roiNormalizedCenter.y,
+                rotationDegrees,
+                isFrontCamera,
+            )
+        focusController?.onRoiCenterChanged(
+            normCenterX = analysisNorm.x,
+            normCenterY = analysisNorm.y,
+            imageWidth = imageAnalysisWidth,
+            imageHeight = imageAnalysisHeight,
+        )
+    }
+
+    /**
+     * Converts a point from the rotated/mirrored display bitmap into ImageAnalysis
+     * (unrotated buffer) normalized coordinates used by CameraX metering.
+     */
+    private fun displayNormalizedToAnalysis(
+        nx: Float,
+        ny: Float,
+        rotationDegrees: Int,
+        isFrontCamera: Boolean,
+    ): PointF {
+        var x = nx
+        val y = ny
+        if (isFrontCamera) {
+            x = 1f - x
+        }
+        return when ((rotationDegrees % 360 + 360) % 360) {
+            90 -> PointF(y, 1f - x)
+            180 -> PointF(1f - x, 1f - y)
+            270 -> PointF(1f - y, x)
+            else -> PointF(x, y)
+        }
     }
 
     private fun calculateVelocity(

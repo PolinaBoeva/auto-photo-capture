@@ -32,7 +32,7 @@ fun CameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val uiState by viewModel.uiState.collectAsState()
-    val poseResults = viewModel.poseResults
+    val poseOverlay = viewModel.poseOverlay
     val captureTrigger by viewModel.captureTrigger.collectAsState()
 
     val previewView =
@@ -62,13 +62,12 @@ fun CameraScreen(
         )
 
         // Pose update
-        LaunchedEffect(poseResults) {
-            poseResults?.let { result ->
-                Log.d(TAG, "Updating pose results in overlay")
+        LaunchedEffect(poseOverlay) {
+            poseOverlay?.let { overlay ->
                 overlayView.setResults(
-                    results = result.results,
-                    imageHeight = result.inputImageHeight,
-                    imageWidth = result.inputImageWidth,
+                    poses = overlay.poses,
+                    imageHeight = overlay.imageHeight,
+                    imageWidth = overlay.imageWidth,
                 )
             }
         }

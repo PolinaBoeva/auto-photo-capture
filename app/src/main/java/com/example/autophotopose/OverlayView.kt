@@ -5,12 +5,36 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.PointF
 import android.util.AttributeSet
 import android.util.Log
 import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+
+/**
+ * Copied pose landmarks for UI. MediaPipe results are only valid during the callback.
+ */
+data class PoseOverlayFrame(
+    val poses: List<List<PointF>>,
+    val imageWidth: Int,
+    val imageHeight: Int,
+) {
+    companion object {
+        fun from(resultBundle: PoseLandmarkerHelper.ResultBundle): PoseOverlayFrame {
+            val poses =
+                resultBundle.results.map { result ->
+                    val landmarks = result.landmarks().firstOrNull().orEmpty()
+                    landmarks.map { PointF(it.x(), it.y()) }
+                }
+            return PoseOverlayFrame(
+                poses = poses,
+                imageWidth = resultBundle.inputImageWidth,
+                imageHeight = resultBundle.inputImageHeight,
+            )
+        }
+    }
+}
 
 class OverlayView
     @JvmOverloads
@@ -34,7 +58,7 @@ class OverlayView
             private const val FLASH_OVERLAY_ALPHA = 180 // 0-255
         }
 
-        private var results: List<PoseLandmarkerResult> = emptyList()
+        private var poses: List<List<PointF>> = emptyList()
         private var imageWidth = 1
         private var imageHeight = 1
 
@@ -89,7 +113,6 @@ class OverlayView
                     }
                     start()
                 }
-            Log.d(TAG, "Capture flash triggered")
         }
 
         /**
@@ -97,19 +120,18 @@ class OverlayView
          * Thread-safe: posts to UI thread if called from background.
          */
         fun setResults(
-            results: List<PoseLandmarkerResult>,
+            poses: List<List<PointF>>,
             imageHeight: Int,
             imageWidth: Int,
         ) {
-            // Ensure UI updates happen on the main thread
             if (!isAttachedToWindow) return
 
             if (Thread.currentThread() != context.mainLooper.thread) {
-                post { setResults(results, imageHeight, imageWidth) }
+                post { setResults(poses, imageHeight, imageWidth) }
                 return
             }
 
-            this.results = results
+            this.poses = poses
             this.imageHeight = imageHeight
             this.imageWidth = imageWidth
 
@@ -126,7 +148,6 @@ class OverlayView
             val viewHeight = height.toFloat()
 
             if (viewWidth <= 0 || viewHeight <= 0 || imageWidth <= 0 || imageHeight <= 0) {
-                Log.w(TAG, "Invalid dimensions: view=${viewWidth}x$viewHeight, image=${imageWidth}x$imageHeight")
                 scaleFactor = 1f
                 offsetX = 0f
                 offsetY = 0f
@@ -135,13 +156,9 @@ class OverlayView
 
             val widthScale = viewWidth / imageWidth
             val heightScale = viewHeight / imageHeight
-
             scaleFactor = maxOf(widthScale, heightScale)
-
             offsetX = (viewWidth - imageWidth * scaleFactor) / 2f
             offsetY = (viewHeight - imageHeight * scaleFactor) / 2f
-
-            Log.d(TAG, "Scale: $scaleFactor, Offset: ($offsetX, $offsetY) | View: ${viewWidth}x$viewHeight, Image: ${imageWidth}x$imageHeight")
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -152,22 +169,17 @@ class OverlayView
                 drawCaptureFlash(canvas)
             }
 
-            // Skip pose drawing if no data
-            if (results.isEmpty()) return
+            if (poses.isEmpty()) return
 
-            // Draw all detected poses
-            for (result in results) {
-                val landmarks = result.landmarks().firstOrNull() ?: continue
+            for (landmarks in poses) {
                 if (landmarks.isEmpty()) continue
 
-                // Draw landmark points
                 for (lm in landmarks) {
-                    val x = lm.x() * imageWidth * scaleFactor + offsetX
-                    val y = lm.y() * imageHeight * scaleFactor + offsetY
+                    val x = lm.x * imageWidth * scaleFactor + offsetX
+                    val y = lm.y * imageHeight * scaleFactor + offsetY
                     canvas.drawCircle(x, y, POINT_RADIUS_PX, pointPaint)
                 }
 
-                // Draw connections between landmarks
                 PoseLandmarker.POSE_LANDMARKS.forEach { connection ->
                     val startIndex = connection.start()
                     val endIndex = connection.end()
@@ -177,10 +189,10 @@ class OverlayView
                     val start = landmarks[startIndex]
                     val end = landmarks[endIndex]
 
-                    val startX = start.x() * imageWidth * scaleFactor + offsetX
-                    val startY = start.y() * imageHeight * scaleFactor + offsetY
-                    val endX = end.x() * imageWidth * scaleFactor + offsetX
-                    val endY = end.y() * imageHeight * scaleFactor + offsetY
+                    val startX = start.x * imageWidth * scaleFactor + offsetX
+                    val startY = start.y * imageHeight * scaleFactor + offsetY
+                    val endX = end.x * imageWidth * scaleFactor + offsetX
+                    val endY = end.y * imageHeight * scaleFactor + offsetY
 
                     canvas.drawLine(startX, startY, endX, endY, linePaint)
                 }
@@ -203,7 +215,7 @@ class OverlayView
                 post { clear() }
                 return
             }
-            results = emptyList()
+            poses = emptyList()
             invalidate()
         }
 
@@ -214,6 +226,5 @@ class OverlayView
             super.onDetachedFromWindow()
             flashAnimator?.cancel()
             flashAnimator = null
-            Log.d(TAG, "View detached, animator cancelled")
         }
     }

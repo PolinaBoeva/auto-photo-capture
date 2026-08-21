@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.SystemClock
 import android.util.Log
-import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageProxy
 import androidx.core.graphics.createBitmap
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -15,6 +14,7 @@ import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+import java.util.concurrent.ConcurrentHashMap
 
 class PoseLandmarkerHelper(
     var minPoseDetectionConfidence: Float = DEFAULT_POSE_DETECTION_CONFIDENCE,
@@ -28,6 +28,8 @@ class PoseLandmarkerHelper(
 ) {
     companion object {
         private const val TAG = "PoseLandmarker"
+        private const val MAX_PENDING_FRAMES = 3
+        private const val STALE_FRAME_TIMEOUT_MS = 2000L
 
         const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.5f
         const val DEFAULT_POSE_TRACKING_CONFIDENCE = 0.5f
@@ -41,14 +43,19 @@ class PoseLandmarkerHelper(
         const val MODEL_POSE_LANDMARKER_HEAVY = 2
     }
 
-    private var poseLandmarker: PoseLandmarker? = null
-
     /**
-     * Last processed frame bitmap for use in AutoCaptureProcessor.
+     * Analysis-frame payload correlated with a MediaPipe LIVE_STREAM timestamp.
      */
-    @Volatile
-    var lastFrameBitmap: Bitmap? = null
-        private set
+    data class PendingFrame(
+        val bitmap: Bitmap,
+        val rotationDegrees: Int,
+        val isFrontCamera: Boolean,
+        val analysisWidth: Int,
+        val analysisHeight: Int,
+    )
+
+    private var poseLandmarker: PoseLandmarker? = null
+    private val framesByTimestamp = ConcurrentHashMap<Long, PendingFrame>()
 
     init {
         setupPoseLandmarker()
@@ -58,8 +65,13 @@ class PoseLandmarkerHelper(
         Log.d(TAG, "Closing PoseLandmarker")
         poseLandmarker?.close()
         poseLandmarker = null
-        lastFrameBitmap = null
+        recycleAllFrames()
     }
+
+    /**
+     * Takes ownership of the bitmap for [timestampMs]. Caller must recycle it.
+     */
+    fun takePendingFrame(timestampMs: Long): PendingFrame? = framesByTimestamp.remove(timestampMs)
 
     fun setupPoseLandmarker() {
         Log.d(TAG, "Setting up PoseLandmarker. Model: $currentModel, Delegate: $currentDelegate")
@@ -115,28 +127,29 @@ class PoseLandmarkerHelper(
      * Processes ImageProxy from CameraX.
      * Converts to Bitmap, applies rotation/mirror, and sends to MediaPipe.
      */
-    @androidx.annotation.OptIn(ExperimentalGetImage::class)
     fun detectLiveStream(
         imageProxy: ImageProxy,
         isFrontCamera: Boolean,
     ) {
         val startTime = SystemClock.uptimeMillis()
+        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+        val analysisWidth = imageProxy.width
+        val analysisHeight = imageProxy.height
 
-        // 1. Convert ImageProxy to Bitmap using KTX function
         val bitmapBuffer =
             createBitmap(
                 imageProxy.width,
                 imageProxy.height,
                 Bitmap.Config.ARGB_8888,
             )
-        bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
+        val planeBuffer = imageProxy.planes[0].buffer
+        planeBuffer.rewind()
+        bitmapBuffer.copyPixelsFromBuffer(planeBuffer)
 
-        // 2. Apply rotation and mirroring
         val matrix =
             Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                postRotate(rotationDegrees.toFloat())
                 if (isFrontCamera) {
-                    // Mirror horizontally around the center
                     postScale(-1f, 1f, bitmapBuffer.width / 2f, bitmapBuffer.height / 2f)
                 }
             }
@@ -151,17 +164,38 @@ class PoseLandmarkerHelper(
                 matrix,
                 true,
             )
-
-        // Recycle temporary buffer immediately
         bitmapBuffer.recycle()
-        lastFrameBitmap = rotatedBitmap
+
+        val landmarker = poseLandmarker
+        if (landmarker == null) {
+            rotatedBitmap.recycle()
+            imageProxy.close()
+            return
+        }
+
+        // Drop this frame rather than recycling an in-flight bitmap MediaPipe still owns.
+        recycleExpiredFrames(startTime)
+        if (framesByTimestamp.size >= MAX_PENDING_FRAMES) {
+            rotatedBitmap.recycle()
+            imageProxy.close()
+            return
+        }
+
+        framesByTimestamp[startTime] =
+            PendingFrame(
+                bitmap = rotatedBitmap,
+                rotationDegrees = rotationDegrees,
+                isFrontCamera = isFrontCamera,
+                analysisWidth = analysisWidth,
+                analysisHeight = analysisHeight,
+            )
 
         try {
-            // 3. Create MPImage from Bitmap and send to MediaPipe
             val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-            poseLandmarker?.detectAsync(mpImage, startTime)
+            landmarker.detectAsync(mpImage, startTime)
         } catch (e: Exception) {
             Log.e(TAG, "MediaPipe processing failed", e)
+            recycleFrame(startTime)
         } finally {
             imageProxy.close()
         }
@@ -170,6 +204,21 @@ class PoseLandmarkerHelper(
         if (processingTime > 50) {
             Log.w(TAG, "Slow frame pipeline: ${processingTime}ms")
         }
+    }
+
+    private fun recycleFrame(timestampMs: Long) {
+        framesByTimestamp.remove(timestampMs)?.bitmap?.let { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+    }
+
+    private fun recycleExpiredFrames(now: Long) {
+        val expired = framesByTimestamp.keys.filter { now - it > STALE_FRAME_TIMEOUT_MS }
+        expired.forEach { recycleFrame(it) }
+    }
+
+    private fun recycleAllFrames() {
+        framesByTimestamp.keys.toList().forEach { recycleFrame(it) }
     }
 
     private fun returnLivestreamResult(
@@ -184,6 +233,7 @@ class PoseLandmarkerHelper(
                 inferenceTime,
                 input.height,
                 input.width,
+                result.timestampMs(),
             ),
         )
     }
@@ -198,6 +248,7 @@ class PoseLandmarkerHelper(
         val inferenceTime: Long,
         val inputImageHeight: Int,
         val inputImageWidth: Int,
+        val timestampMs: Long,
     )
 
     interface LandmarkerListener {

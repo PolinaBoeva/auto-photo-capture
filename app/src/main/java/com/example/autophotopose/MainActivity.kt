@@ -3,49 +3,56 @@ package com.example.autophotopose
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import com.example.autophotopose.ui.CameraScreen
 
 class MainActivity : ComponentActivity() {
-    companion object {
-        private const val TAG = "MainActivity"
-    }
-
-    // Modern delegate for ViewModel initialization
     private val cameraViewModel: CameraViewModel by viewModels()
-
-    private val requestPermissionLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.RequestPermission(),
-        ) { isGranted ->
-            if (isGranted) {
-                Log.d(TAG, "Camera permission granted")
-            } else {
-                Log.w(TAG, "Camera permission denied. Closing app.")
-                Toast.makeText(this, "Camera permission is required to use this app.", Toast.LENGTH_LONG).show()
-                finish()
-            }
-        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.d(TAG, "onCreate: Initializing MainActivity")
 
-        if (!hasCameraPermission()) {
-            Log.d(TAG, "Requesting camera permission")
-            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
-        } else {
-            Log.d(TAG, "Camera permission already granted")
-        }
+        val cameraGrantedInitially = hasCameraPermission()
 
         setContent {
-            CameraScreen(viewModel = cameraViewModel)
+            var hasCameraPermission by remember { mutableStateOf(cameraGrantedInitially) }
+
+            val permissionLauncher =
+                rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission(),
+                ) { granted ->
+                    if (granted) {
+                        hasCameraPermission = true
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Camera permission is required to use this app.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        finish()
+                    }
+                }
+
+            LaunchedEffect(Unit) {
+                if (!hasCameraPermission) {
+                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                }
+            }
+
+            if (hasCameraPermission) {
+                CameraScreen(viewModel = cameraViewModel)
+            }
         }
     }
 

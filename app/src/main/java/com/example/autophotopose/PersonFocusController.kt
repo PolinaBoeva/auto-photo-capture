@@ -58,6 +58,7 @@ class PersonFocusController(
         val pixelX = normCenterX * imageWidth
         val pixelY = normCenterY * imageHeight
 
+        val elapsed = now - lastFocusTime
         lastFocusTime = now
         lastNormalizedCenter.set(normCenterX, normCenterY)
 
@@ -69,7 +70,7 @@ class PersonFocusController(
                 .build()
 
         cameraControl.startFocusAndMetering(action)
-        Log.d(TAG, "Focus updated: (${pixelX.toInt()}, ${pixelY.toInt()}) | interval=${now - lastFocusTime}ms")
+        Log.d(TAG, "Focus updated: (${pixelX.toInt()}, ${pixelY.toInt()}) | interval=${elapsed}ms")
     }
 
     /** Resets internal state. Call when camera is closed or reinitialized. */

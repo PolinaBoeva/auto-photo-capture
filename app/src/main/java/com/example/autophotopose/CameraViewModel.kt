@@ -61,7 +61,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _captureTrigger = MutableStateFlow(0)
     val captureTrigger: StateFlow<Int> = _captureTrigger
 
-    var poseResults by mutableStateOf<PoseLandmarkerHelper.ResultBundle?>(null)
+    var poseOverlay by mutableStateOf<PoseOverlayFrame?>(null)
         private set
 
     private val appContext = getApplication<Application>()
@@ -86,6 +86,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // Focus components
     private var meteringPointFactory: SurfaceOrientedMeteringPointFactory? = null
     private var focusController: PersonFocusController? = null
+    private var meteringFactoryWidth: Int = 0
+    private var meteringFactoryHeight: Int = 0
 
     // ========================= INITIALIZATION =========================
     init {
@@ -174,22 +176,45 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     private fun initializeFocusComponents() {
         val camera = currentCamera ?: return
+        val width = currentAnalysisWidth.takeIf { it > 0 } ?: ANALYSIS_RESOLUTION.width
+        val height = currentAnalysisHeight.takeIf { it > 0 } ?: ANALYSIS_RESOLUTION.height
+        attachFocusController(camera, width, height)
+        Log.d(TAG, "Focus components initialized")
+    }
 
+    private fun ensureFocusFactory(
+        width: Int,
+        height: Int,
+    ) {
+        if (width <= 0 || height <= 0) return
+        val camera = currentCamera ?: return
+        if (focusController != null &&
+            meteringFactoryWidth == width &&
+            meteringFactoryHeight == height
+        ) {
+            return
+        }
+        attachFocusController(camera, width, height)
+    }
+
+    private fun attachFocusController(
+        camera: Camera,
+        width: Int,
+        height: Int,
+    ) {
+        meteringFactoryWidth = width
+        meteringFactoryHeight = height
         meteringPointFactory =
             SurfaceOrientedMeteringPointFactory(
-                ANALYSIS_RESOLUTION.width.toFloat(),
-                ANALYSIS_RESOLUTION.height.toFloat(),
+                width.toFloat(),
+                height.toFloat(),
             )
-
         focusController =
             PersonFocusController(
                 cameraControl = camera.cameraControl,
                 meteringPointFactory = meteringPointFactory!!,
             )
-
         captureProcessor.setFocusController(focusController)
-
-        Log.d(TAG, "Focus components initialized")
     }
 
     private fun createImageAnalysis(): ImageAnalysis {
@@ -213,6 +238,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 analysis.setAnalyzer(cameraExecutor) { proxy ->
                     currentAnalysisWidth = proxy.width
                     currentAnalysisHeight = proxy.height
+                    ensureFocusFactory(proxy.width, proxy.height)
 
                     poseHelper.detectLiveStream(proxy, _uiState.value.isFrontCamera)
                 }
@@ -240,22 +266,34 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     // ========================= LOGIC HANDLERS =========================
     private fun handlePoseResult(resultBundle: PoseLandmarkerHelper.ResultBundle) {
-        poseResults = resultBundle
-
-        if (!_uiState.value.isCaptureActive) return
-
-        val bitmap = poseHelper.lastFrameBitmap
-        if (bitmap == null) {
-            Log.w(TAG, "Skipping frame: lastFrameBitmap is null")
-            return
+        val overlay = PoseOverlayFrame.from(resultBundle)
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            poseOverlay = overlay
         }
 
-        captureProcessor.processFrame(
-            bitmap = bitmap,
-            resultBundle = resultBundle,
-            imageAnalysisWidth = ANALYSIS_RESOLUTION.width,
-            imageAnalysisHeight = ANALYSIS_RESOLUTION.height,
-        )
+        val pending = poseHelper.takePendingFrame(resultBundle.timestampMs)
+        try {
+            if (!_uiState.value.isCaptureActive) return
+
+            val bitmap = pending?.bitmap
+            if (bitmap == null || bitmap.isRecycled) {
+                Log.w(TAG, "Skipping frame: pending bitmap is missing or recycled")
+                return
+            }
+
+            captureProcessor.processFrame(
+                bitmap = bitmap,
+                resultBundle = resultBundle,
+                imageAnalysisWidth = pending.analysisWidth,
+                imageAnalysisHeight = pending.analysisHeight,
+                rotationDegrees = pending.rotationDegrees,
+                isFrontCamera = pending.isFrontCamera,
+            )
+        } finally {
+            pending?.bitmap?.let { frame ->
+                if (!frame.isRecycled) frame.recycle()
+            }
+        }
     }
 
     private fun triggerCapture() {
@@ -279,6 +317,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private fun takePicture() {
         if (!::imageCapture.isInitialized) {
             Log.e(TAG, "Cannot take picture: ImageCapture not initialized")
+            captureProcessor.notifyCaptureFinished(captureSucceeded = false)
             return
         }
 
@@ -294,7 +333,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
                 override fun onError(exception: ImageCaptureException) {
                     Log.e(TAG, "Capture failed", exception)
-                    captureProcessor.notifyCaptureFinished()
+                    captureProcessor.notifyCaptureFinished(captureSucceeded = false)
                 }
             },
         )
@@ -302,8 +341,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun processAndSaveImage(image: ImageProxy) {
         try {
-            val jpegBytes = ByteArray(image.planes[0].buffer.remaining())
-            image.planes[0].buffer.get(jpegBytes)
+            val jpegBuffer = image.planes[0].buffer
+            jpegBuffer.rewind()
+            val jpegBytes = ByteArray(jpegBuffer.remaining())
+            jpegBuffer.get(jpegBytes)
 
             val rotation = image.imageInfo.rotationDegrees
 
@@ -329,12 +370,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     matrix,
                     true,
                 )
+            if (bitmap != bitmapRaw) {
+                bitmapRaw.recycle()
+            }
 
-            saveBitmapToGallery(bitmap)
-            captureProcessor.notifyCaptureFinished()
+            try {
+                val saved = saveBitmapToGallery(bitmap)
+                captureProcessor.notifyCaptureFinished(captureSucceeded = saved)
+            } finally {
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error processing image", e)
-            captureProcessor.notifyCaptureFinished()
+            captureProcessor.notifyCaptureFinished(captureSucceeded = false)
         } finally {
             image.close()
         }
@@ -454,8 +502,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         return sampleSize
     }
 
-    private fun saveBitmapToGallery(bitmap: Bitmap) {
-        try {
+    private fun saveBitmapToGallery(bitmap: Bitmap): Boolean {
+        return try {
             val filename = "AutoPose_${System.currentTimeMillis()}.jpg"
             val contentValues =
                 ContentValues().apply {
@@ -484,8 +532,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             _uiState.value = _uiState.value.copy(lastGalleryBitmap = previewBitmap)
 
             Log.d(TAG, "Photo saved successfully: $filename")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save bitmap to gallery", e)
+            false
         }
     }
 
@@ -508,6 +558,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         _uiState.value = _uiState.value.copy(isFrontCamera = newFrontState)
         captureProcessor.reset()
+        meteringFactoryWidth = 0
+        meteringFactoryHeight = 0
+        focusController = null
         createImageCapture()
     }
 
